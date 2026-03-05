@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"path"
 	"time"
 
 	"github.com/akave-ai/akavelog/internal/config"
@@ -82,15 +81,6 @@ func (c *O3Client) PutObject(ctx context.Context, key string, data []byte, conte
 		ContentType: aws.String(contentType),
 	})
 	return err
-}
-
-// KeyForBatch returns an object key for a log batch (e.g. logs/default/2024/02/17/abc123.json.gz).
-func KeyForBatch(projectID string, batchID string, ext string) string {
-	if projectID == "" {
-		projectID = "default"
-	}
-	now := time.Now().UTC()
-	return path.Join("logs", projectID, now.Format("2006/01/02"), batchID+ext)
 }
 
 // ObjectInfo describes an object in O3 (for list response).

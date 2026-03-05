@@ -17,13 +17,13 @@ type Config struct {
 	Database      DatabaseConfig       `koanf:"database" validate:"required"`
 	Observability *ObservabilityConfig `koanf:"observability" validate:"required"`
 	Storage       *StorageConfig       `koanf:"storage"`       // optional; Akave O3 when set
-	Batcher       *BatcherConfig       `koanf:"batcher"`       // optional; batch size and flush interval
+	Ingester      *IngesterConfig      `koanf:"ingester"`     // optional; chunk flush timing
 }
 
-// BatcherConfig is optional; used when Storage.O3 is set.
-type BatcherConfig struct {
-	MaxBatchSize  int    `koanf:"max_batch_size"`  // flush when batch has this many entries (default 1000)
-	FlushInterval string `koanf:"flush_interval"`  // e.g. "5s", "30s" (default 30s)
+// IngesterConfig controls when in-memory chunks are flushed to O3.
+type IngesterConfig struct {
+	ChunkIdleSeconds int `koanf:"chunk_idle_seconds"` // flush after this many seconds with no new logs; 0 = use default (30 min)
+	ChunkMaxEntries  int `koanf:"chunk_max_entries"` // close chunk after this many entries; 0 = use default (10000)
 }
 
 // StorageConfig holds storage backends (e.g. Akave O3).

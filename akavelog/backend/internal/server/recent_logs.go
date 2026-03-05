@@ -37,7 +37,7 @@ func (s *RecentLogsStore) Add(raw []byte) {
 	s.AddEntry(&e)
 }
 
-// AddEntry appends a validated log entry (e.g. from batcher OnLog callback).
+// AddEntry appends a log entry (e.g. from push onLog callback).
 func (s *RecentLogsStore) AddEntry(e *model.LogEntry) {
 	if e == nil {
 		return

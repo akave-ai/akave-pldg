@@ -3,50 +3,27 @@
 import { useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
 import {
-  createInput,
-  deleteInput,
-  getInputs,
-  getIngestBaseUrlForInput,
-  getLogsFromIngest,
-  getTypeInfo,
+  getPushUrl,
+  getRecentLogs,
   getUploadStatus,
-  sendTestLog,
-  updateInput,
-  type InputItem,
-  type InputTypeInfo,
+  sendAkavelogPush,
+  type AkavelogStream,
   type LogEntry,
   type UploadStatus as UploadStatusType,
 } from '@/lib/api';
 
 export default function DemoPage() {
-  const [inputs, setInputs] = useState<InputItem[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [uploadStatus, setUploadStatus] = useState<UploadStatusType | null>(null);
-  const [creating, setCreating] = useState(false);
+  const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [httpTypeInfo, setHttpTypeInfo] = useState<InputTypeInfo | null>(null);
-  const [newTitle, setNewTitle] = useState('my-http-input');
-  const [formValues, setFormValues] = useState<Record<string, string>>({});
-  const [editingId, setEditingId] = useState<string | null>(null);
-  const [editTitle, setEditTitle] = useState('');
-  const [editFormValues, setEditFormValues] = useState<Record<string, string>>({});
-  const [updating, setUpdating] = useState(false);
-  const [deletingId, setDeletingId] = useState<string | null>(null);
-
-  const loadInputs = useCallback(async () => {
-    try {
-      const { inputs: list } = await getInputs();
-      setInputs(list);
-      setError(null);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load inputs');
-    }
-  }, []);
+  const [logMessage, setLogMessage] = useState('');
+  const [pushMs, setPushMs] = useState<number | null>(null);
+  const [copyCurlDone, setCopyCurlDone] = useState(false);
 
   const loadLogs = useCallback(async () => {
     try {
-      // GET ingest endpoint directly (raw HTTP) to fetch logs
-      const { logs: list } = await getLogsFromIngest('raw');
+      const { logs: list } = await getRecentLogs();
       setLogs(list);
     } catch {
       // ignore
@@ -63,21 +40,9 @@ export default function DemoPage() {
   }, []);
 
   useEffect(() => {
-    loadInputs();
-  }, [loadInputs]);
-
-  useEffect(() => {
-    getTypeInfo('http')
-      .then((info) => {
-        setHttpTypeInfo(info);
-        const initial: Record<string, string> = {};
-        info.fields.forEach((f) => {
-          initial[f.name] = f.example ?? '';
-        });
-        setFormValues(initial);
-      })
-      .catch(() => setHttpTypeInfo(null));
-  }, []);
+    loadLogs();
+    loadStatus();
+  }, [loadLogs, loadStatus]);
 
   useEffect(() => {
     const t = setInterval(() => {
@@ -87,126 +52,52 @@ export default function DemoPage() {
     return () => clearInterval(t);
   }, [loadLogs, loadStatus]);
 
-  const handleCreate = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setCreating(true);
-    setError(null);
-    try {
-      const config: Record<string, unknown> = {};
-      Object.entries(formValues).forEach(([k, v]) => {
-        const trimmed = typeof v === 'string' ? v.trim() : v;
-        if (trimmed !== '') config[k] = trimmed;
-      });
-      await createInput({
-        type: 'http',
-        title: newTitle.trim() || undefined,
-        config: Object.keys(config).length > 0 ? config : undefined,
-      });
-      await loadInputs();
-      setNewTitle('');
-      if (httpTypeInfo) {
-        const reset: Record<string, string> = {};
-        httpTypeInfo.fields.forEach((f) => {
-          reset[f.name] = f.example ?? '';
-        });
-        setFormValues(reset);
-      }
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Create failed');
-    } finally {
-      setCreating(false);
-    }
-  };
+  const buildPushPayload = (message: string): AkavelogStream[] => [
+    {
+      stream: { job: 'demo-ui', app: 'akavelog' },
+      values: [[String(Date.now() * 1_000_000), message || `Test log at ${new Date().toISOString()}`]],
+    },
+  ];
 
-  const handleSendTest = async (input: InputItem) => {
-    const path = ingestPath(input);
-    const baseUrl = getIngestBaseUrlForInput(input);
+  const handleSendTest = async () => {
+    setSending(true);
+    setError(null);
+    setPushMs(null);
+    const payload = buildPushPayload(logMessage);
+    const t0 = performance.now();
     try {
-      await sendTestLog(
-        path,
-        {
-          service: 'demo-ui',
-          message: `Test log at ${new Date().toISOString()}`,
-          level: 'info',
-          tags: { source: 'web' },
-        },
-        { baseUrl: baseUrl ?? undefined }
-      );
+      await sendAkavelogPush(payload);
+      setPushMs(Math.round(performance.now() - t0));
       await loadLogs();
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Send failed');
-    }
-  };
-
-  const startEdit = (inp: InputItem) => {
-    setEditingId(inp.id);
-    setEditTitle(inp.title);
-    const cfg = (inp.configuration || {}) as Record<string, string>;
-    if (httpTypeInfo) {
-      const values: Record<string, string> = {};
-      httpTypeInfo.fields.forEach((f) => {
-        values[f.name] = cfg[f.name] ?? f.example ?? '';
-      });
-      setEditFormValues(values);
-    }
-  };
-
-  const cancelEdit = () => {
-    setEditingId(null);
-  };
-
-  const handleUpdate = async (e: React.FormEvent, id: string) => {
-    e.preventDefault();
-    setUpdating(true);
-    setError(null);
-    try {
-      const config: Record<string, unknown> = {};
-      Object.entries(editFormValues).forEach(([k, v]) => {
-        const trimmed = typeof v === 'string' ? v.trim() : v;
-        if (trimmed !== '') config[k] = trimmed;
-      });
-      await updateInput(id, {
-        title: editTitle.trim() || undefined,
-        config: Object.keys(config).length > 0 ? config : undefined,
-      });
-      await loadInputs();
-      setEditingId(null);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Update failed');
     } finally {
-      setUpdating(false);
+      setSending(false);
     }
   };
 
-  const handleDelete = async (id: string) => {
-    if (!confirm('Delete this input? It will stop receiving logs.')) return;
-    setDeletingId(id);
-    setError(null);
+  const getCurlCommand = () => {
+    const url = typeof window !== 'undefined' ? getPushUrl() : 'http://localhost:3000/api/akavelog/api/v1/push';
+    const payload = buildPushPayload(logMessage);
+    const body = JSON.stringify({ streams: payload });
+    const escaped = body.replace(/'/g, "'\\''");
+    return `curl -X POST '${url}' \\
+  -H 'Content-Type: application/json' \\
+  -d '${escaped}'`;
+  };
+
+  const handleCopyCurl = async () => {
     try {
-      await deleteInput(id);
-      await loadInputs();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Delete failed');
-    } finally {
-      setDeletingId(null);
+      await navigator.clipboard.writeText(getCurlCommand());
+      setCopyCurlDone(true);
+      setTimeout(() => setCopyCurlDone(false), 2000);
+    } catch {
+      setError('Copy failed');
     }
-  };
-
-  const ingestPath = (input: InputItem) => {
-    const cfg = input.configuration as { description?: string; listen?: string };
-    if (cfg?.listen) return ''; // dedicated port: path is just /ingest
-    return (cfg?.description as string) || 'raw';
-  };
-
-  const ingestDisplayPath = (input: InputItem) => {
-    const cfg = input.configuration as { listen?: string };
-    if (cfg?.listen) return '/ingest';
-    return `/ingest/${ingestPath(input) || 'raw'}`;
   };
 
   return (
     <div className="min-h-screen flex flex-col md:flex-row gap-4 p-4 bg-[var(--bg)]">
-      {/* Main content */}
       <div className="flex-1 flex flex-col gap-4 min-w-0">
         <header className="border-b border-[var(--border)] pb-2">
           <div className="flex items-center gap-4 flex-wrap">
@@ -214,8 +105,13 @@ export default function DemoPage() {
             <Link href="/uploads" className="text-sm text-[var(--muted)] hover:text-[var(--accent)]">
               View O3 uploads →
             </Link>
+            <Link href="/stored" className="text-sm text-[var(--muted)] hover:text-[var(--accent)]">
+              Stored data (raw) →
+            </Link>
           </div>
-          <p className="text-sm text-[var(--muted)]">Create HTTP input, send logs, watch uploads to Akave O3</p>
+          <p className="text-sm text-[var(--muted)]">
+            Push logs via POST /akavelog/api/v1/push. Watch uploads to Akave O3.
+          </p>
         </header>
 
         {error && (
@@ -224,154 +120,50 @@ export default function DemoPage() {
           </div>
         )}
 
-        {/* Create HTTP input — form driven by backend type config */}
         <section className="rounded-xl bg-[var(--card)] border border-[var(--border)] p-4">
-          <h2 className="text-sm font-medium text-[var(--muted)] mb-3">1. Create HTTP input</h2>
-          {!httpTypeInfo ? (
-            <p className="text-sm text-[var(--muted)]">Loading input config…</p>
-          ) : (
-            <form onSubmit={handleCreate} className="flex flex-wrap items-end gap-3">
-              <label className="flex flex-col gap-1">
-                <span className="text-xs text-[var(--muted)]">Title</span>
-                <input
-                  type="text"
-                  value={newTitle}
-                  onChange={(e) => setNewTitle(e.target.value)}
-                  placeholder="my-http-input"
-                  className="rounded-lg bg-[var(--bg)] border border-[var(--border)] px-3 py-2 text-sm w-40"
-                />
-              </label>
-              {httpTypeInfo.fields.map((field) => (
-                <label key={field.name} className="flex flex-col gap-1">
-                  <span className="text-xs text-[var(--muted)]">
-                    {field.description}
-                    {field.required ? ' *' : ''}
-                  </span>
-                  <input
-                    type={field.type === 'number' ? 'number' : 'text'}
-                    value={formValues[field.name] ?? ''}
-                    onChange={(e) =>
-                      setFormValues((prev) => ({ ...prev, [field.name]: e.target.value }))
-                    }
-                    placeholder={field.example}
-                    className="rounded-lg bg-[var(--bg)] border border-[var(--border)] px-3 py-2 text-sm w-40"
-                  />
-                </label>
-              ))}
-              <button
-                type="submit"
-                disabled={creating}
-                className="rounded-lg bg-[var(--accent)] text-[var(--bg)] px-4 py-2 text-sm font-medium disabled:opacity-50"
-              >
-                {creating ? 'Creating…' : 'Create input'}
-              </button>
-            </form>
-          )}
+          <h2 className="text-sm font-medium text-[var(--muted)] mb-3">Push logs</h2>
+          <p className="text-sm text-[var(--muted)] mb-3">
+            POST /akavelog/api/v1/push with JSON: streams[].stream (labels), streams[].values ([ts_ns, line]). Chunks flush to O3 after 5s idle or 50 entries.
+          </p>
+          <div className="mb-3">
+            <input
+              type="text"
+              value={logMessage}
+              onChange={(e) => setLogMessage(e.target.value)}
+              placeholder="the log"
+              className="w-full rounded-lg bg-[var(--bg)] border border-[var(--border)] px-3 py-2 text-sm font-mono placeholder:text-[var(--muted)]"
+            />
+          </div>
+          <div className="flex flex-wrap gap-2 items-center">
+            <button
+              type="button"
+              onClick={handleSendTest}
+              disabled={sending}
+              className="rounded-lg bg-[var(--accent)] text-[var(--bg)] px-4 py-2 text-sm font-medium disabled:opacity-50"
+            >
+              {sending ? 'Sending…' : 'Send test log'}
+            </button>
+            {pushMs != null && (
+              <span className="text-sm text-[var(--muted)]">Push took {pushMs} ms</span>
+            )}
+            <button
+              type="button"
+              onClick={handleCopyCurl}
+              className="rounded-lg bg-[var(--border)] hover:bg-[var(--muted)] px-4 py-2 text-sm disabled:opacity-50"
+            >
+              {copyCurlDone ? 'Copied!' : 'Copy curl'}
+            </button>
+          </div>
+          <p className="text-xs text-[var(--muted)] mt-2">
+            Use &quot;Copy curl&quot; and run in terminal to test the same request. Logs flush to O3 within ~5s of last write.
+          </p>
         </section>
 
-        {/* Inputs list */}
-        <section className="rounded-xl bg-[var(--card)] border border-[var(--border)] p-4 flex-1 min-h-0 flex flex-col">
-          <h2 className="text-sm font-medium text-[var(--muted)] mb-3">2. Your inputs</h2>
-          {inputs.length === 0 ? (
-            <p className="text-sm text-[var(--muted)]">Create an input above. Then use “Send test log” to post to /ingest/raw.</p>
-          ) : (
-            <ul className="space-y-2 overflow-auto">
-              {inputs.map((inp) => (
-                <li
-                  key={inp.id}
-                  className="rounded-lg bg-[var(--bg)] border border-[var(--border)] overflow-hidden"
-                >
-                  {editingId === inp.id && httpTypeInfo ? (
-                    <form
-                      onSubmit={(e) => handleUpdate(e, inp.id)}
-                      className="p-3 space-y-3"
-                    >
-                      <div className="flex flex-wrap items-end gap-3">
-                        <label className="flex flex-col gap-1">
-                          <span className="text-xs text-[var(--muted)]">Title</span>
-                          <input
-                            type="text"
-                            value={editTitle}
-                            onChange={(e) => setEditTitle(e.target.value)}
-                            placeholder="my-http-input"
-                            className="rounded-lg bg-[var(--card)] border border-[var(--border)] px-3 py-2 text-sm w-40"
-                          />
-                        </label>
-                        {httpTypeInfo.fields.map((field) => (
-                          <label key={field.name} className="flex flex-col gap-1">
-                            <span className="text-xs text-[var(--muted)]">{field.description}</span>
-                            <input
-                              type={field.type === 'number' ? 'number' : 'text'}
-                              value={editFormValues[field.name] ?? ''}
-                              onChange={(e) =>
-                                setEditFormValues((prev) => ({ ...prev, [field.name]: e.target.value }))
-                              }
-                              placeholder={field.example}
-                              className="rounded-lg bg-[var(--card)] border border-[var(--border)] px-3 py-2 text-sm w-40"
-                            />
-                          </label>
-                        ))}
-                      </div>
-                      <div className="flex gap-2">
-                        <button
-                          type="submit"
-                          disabled={updating}
-                          className="rounded-lg bg-[var(--accent)] text-[var(--bg)] px-3 py-1.5 text-sm font-medium disabled:opacity-50"
-                        >
-                          {updating ? 'Saving…' : 'Save'}
-                        </button>
-                        <button
-                          type="button"
-                          onClick={cancelEdit}
-                          className="rounded-lg bg-[var(--border)] hover:bg-[var(--muted)] px-3 py-1.5 text-sm"
-                        >
-                          Cancel
-                        </button>
-                      </div>
-                    </form>
-                  ) : (
-                    <div className="flex items-center justify-between gap-2 px-3 py-2 text-sm flex-wrap">
-                      <span className="font-mono text-[var(--accent)]">{inp.title}</span>
-                      <span className="text-[var(--muted)]">{ingestDisplayPath(inp)}</span>
-                      <span className="text-xs text-[var(--success)]">{inp.state}</span>
-                      <div className="flex gap-1.5">
-                        <button
-                          type="button"
-                          onClick={() => handleSendTest(inp)}
-                          className="rounded bg-[var(--border)] hover:bg-[var(--accent)] hover:text-[var(--bg)] px-2 py-1 text-xs"
-                        >
-                          Send test log
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => startEdit(inp)}
-                          className="rounded bg-[var(--border)] hover:bg-[var(--accent)] hover:text-[var(--bg)] px-2 py-1 text-xs"
-                        >
-                          Edit
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => handleDelete(inp.id)}
-                          disabled={deletingId === inp.id}
-                          className="rounded bg-red-500/20 text-red-400 hover:bg-red-500/40 px-2 py-1 text-xs disabled:opacity-50"
-                        >
-                          {deletingId === inp.id ? 'Deleting…' : 'Delete'}
-                        </button>
-                      </div>
-                    </div>
-                  )}
-                </li>
-              ))}
-            </ul>
-          )}
-        </section>
-
-        {/* Incoming logs */}
         <section className="rounded-xl bg-[var(--card)] border border-[var(--border)] p-4 flex-1 min-h-[200px] flex flex-col">
-          <h2 className="text-sm font-medium text-[var(--muted)] mb-3">3. Incoming logs (last 200)</h2>
+          <h2 className="text-sm font-medium text-[var(--muted)] mb-3">Incoming logs (last 200)</h2>
           <div className="flex-1 overflow-auto rounded-lg bg-[var(--bg)] border border-[var(--border)] p-2 font-mono text-xs">
             {logs.length === 0 ? (
-              <p className="text-[var(--muted)]">Logs fetched via GET /ingest/raw. Send to /ingest/raw then they appear here (polling every 2s).</p>
+              <p className="text-[var(--muted)]">Logs appear here after you push. Polling every 2s.</p>
             ) : (
               <ul className="space-y-2">
                 {[...logs].reverse().map((l, i) => (
@@ -414,7 +206,6 @@ export default function DemoPage() {
         </section>
       </div>
 
-      {/* Side panel: upload status */}
       <aside className="w-full md:w-80 shrink-0 rounded-xl bg-[var(--card)] border border-[var(--border)] p-4 h-fit">
         <h2 className="text-sm font-medium text-[var(--muted)] mb-3">Upload status (O3)</h2>
         {!uploadStatus ? (
