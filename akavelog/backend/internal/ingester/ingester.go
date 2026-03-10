@@ -8,6 +8,7 @@ import (
 
 	"github.com/akave-ai/akavelog/internal/chunk"
 	"github.com/akave-ai/akavelog/internal/index"
+	logbatches "github.com/akave-ai/akavelog/internal/model/log_batches"
 	"github.com/akave-ai/akavelog/internal/push"
 )
 
@@ -15,11 +16,19 @@ const defaultTenant = "default"
 const flushQueueSize = 1024
 const sweepInterval = 15 * time.Second
 
+// DBIndexer is the interface the ingester uses to write metadata to PostgreSQL after
+// each successful O3 upload. Implemented by *repository.LogBatchRepository.
+// Defined here (not in repository) to keep the ingester free of DB import cycles.
+type DBIndexer interface {
+	Insert(ctx context.Context, p logbatches.InsertParams) error
+}
+
 // Ingester receives push requests, appends to streams/chunks in memory, and flushes closed chunks to the store.
 type Ingester struct {
 	config      StreamConfig
 	store       chunk.Store
-	indexWriter index.Writer // optional; records chunk refs to Progress index
+	indexWriter index.Writer // optional; records chunk refs to O3 Progress index
+	dbIndexer   DBIndexer    // optional; writes metadata row to PostgreSQL (Phase 4)
 	mu          sync.RWMutex
 	instances   map[string]*Instance
 	flushQueue  chan *flushOp
@@ -36,7 +45,8 @@ type flushOp struct {
 }
 
 // NewIngester creates an ingester that writes chunks to the given store.
-// indexWriter is optional; when set, chunk refs are written to the Progress index (not TSDB).
+// indexWriter is optional; when set, chunk refs are written to the O3 Progress index.
+// dbIndexer  is optional; when set, metadata rows are written to PostgreSQL.
 func NewIngester(store chunk.Store, config StreamConfig, indexWriter index.Writer) *Ingester {
 	if store == nil {
 		panic("store is required")
@@ -63,6 +73,12 @@ func NewIngester(store chunk.Store, config StreamConfig, indexWriter index.Write
 	ing.instances[defaultTenant] = newInstance(defaultTenant, config, ing.enqueueFlush)
 	ing.mu.Unlock()
 	return ing
+}
+
+// WithDBIndexer attaches a PostgreSQL metadata indexer (Phase 4).
+// Must be called before Start().
+func (i *Ingester) WithDBIndexer(db DBIndexer) {
+	i.dbIndexer = db
 }
 
 // OnFlush sets a callback invoked after each chunk is written (count, object key).
@@ -140,27 +156,96 @@ func (i *Ingester) flushLoop(ctx context.Context) {
 			if op == nil {
 				continue
 			}
-			ch := chunk.Chunk{
-				Tenant:  op.tenant,
-				Labels:  op.labels,
-				Entries: make([]chunk.Entry, len(op.desc.entries)),
-				FromNs:  op.desc.fromNs,
-				ToNs:    op.desc.toNs,
-			}
-			copy(ch.Entries, op.desc.entries)
-			if err := i.store.Put(ctx, []chunk.Chunk{ch}); err != nil {
-				log.Printf("[ingester] flush put: %v", err)
-				continue
-			}
-			streamID := chunk.StreamID(ch.Labels)
-			key := chunk.KeyForChunk(ch.Tenant, streamID, ch.FromNs, ch.ToNs)
-			log.Printf("[ingester] flushed %s (%d entries)", key, len(ch.Entries))
-			if i.indexWriter != nil {
-				i.indexWriter.IndexChunk(ctx, ch.Tenant, streamID, ch.FromNs, ch.ToNs, key)
-			}
-			if i.onFlush != nil {
-				i.onFlush(len(ch.Entries), key)
-			}
+			i.handleFlush(ctx, op)
 		}
 	}
+}
+
+// handleFlush writes one chunk to O3, then records its metadata in both the O3
+// Progress index and the PostgreSQL log_batches table.
+func (i *Ingester) handleFlush(ctx context.Context, op *flushOp) {
+	ch := chunk.Chunk{
+		Tenant:  op.tenant,
+		Labels:  op.labels,
+		Entries: make([]chunk.Entry, len(op.desc.entries)),
+		FromNs:  op.desc.fromNs,
+		ToNs:    op.desc.toNs,
+	}
+	copy(ch.Entries, op.desc.entries)
+
+	// ── 1. Upload chunk to O3 ─────────────────────────────────────────────────
+	if err := i.store.Put(ctx, []chunk.Chunk{ch}); err != nil {
+		log.Printf("[ingester] flush put: %v", err)
+		return
+	}
+
+	streamID := chunk.StreamID(ch.Labels)
+	key := chunk.KeyForChunk(ch.Tenant, streamID, ch.FromNs, ch.ToNs)
+	log.Printf("[ingester] flushed %s (%d entries)", key, len(ch.Entries))
+
+	// ── 2. Record in O3 Progress index (NDJSON) ───────────────────────────────
+	if i.indexWriter != nil {
+		i.indexWriter.IndexChunk(ctx, ch.Tenant, streamID, ch.FromNs, ch.ToNs, key)
+	}
+
+	// ── 3. Record metadata in PostgreSQL log_batches (Phase 4) ───────────────
+	if i.dbIndexer != nil {
+		params := buildInsertParams(ch, streamID, key)
+		if err := i.dbIndexer.Insert(ctx, params); err != nil {
+			// Non-fatal: chunk is safe in O3; log and continue.
+			log.Printf("[ingester] db index insert failed for %s: %v", key, err)
+		}
+	}
+
+	// ── 4. Notify server-level status store ───────────────────────────────────
+	if i.onFlush != nil {
+		i.onFlush(len(ch.Entries), key)
+	}
+}
+
+// buildInsertParams constructs the PostgreSQL insert payload from a flushed chunk.
+// Service is extracted from stream labels using the same priority as the recent-logs UI:
+// "job" > "app" > "service" > "akavelog" (fallback).
+func buildInsertParams(ch chunk.Chunk, streamID, key string) logbatches.InsertParams {
+	service := extractService(ch.Labels)
+	levels := extractLevels(ch.Labels)
+
+	return logbatches.InsertParams{
+		ProjectID:   nil, // Phase 8 will wire project_id via API-key middleware
+		Tenant:      ch.Tenant,
+		StreamID:    streamID,
+		Service:     service,
+		TsStart:     time.Unix(0, ch.FromNs).UTC(),
+		TsEnd:       time.Unix(0, ch.ToNs).UTC(),
+		Levels:      levels,
+		Tags:        ch.Labels,
+		O3ObjectKey: key,
+		EntryCount:  len(ch.Entries),
+	}
+}
+
+// extractService mirrors the labelsToLogEntry heuristic in server.go so that
+// the service stored in log_batches is consistent with what the UI shows.
+func extractService(labels map[string]string) string {
+	if labels == nil {
+		return "akavelog"
+	}
+	for _, key := range []string{"job", "app", "service"} {
+		if v := labels[key]; v != "" {
+			return v
+		}
+	}
+	return "akavelog"
+}
+
+// extractLevels returns the "level" label as a single-element slice if present,
+// or an empty slice. Phase 5 can enrich this by scanning entry lines.
+func extractLevels(labels map[string]string) []string {
+	if labels == nil {
+		return []string{}
+	}
+	if l := labels["level"]; l != "" {
+		return []string{l}
+	}
+	return []string{}
 }
