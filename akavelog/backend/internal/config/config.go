@@ -16,14 +16,14 @@ type Config struct {
 	Server        ServerConfig         `koanf:"server" validate:"required"`
 	Database      DatabaseConfig       `koanf:"database" validate:"required"`
 	Observability *ObservabilityConfig `koanf:"observability" validate:"required"`
-	Storage       *StorageConfig       `koanf:"storage"`       // optional; Akave O3 when set
-	Ingester      *IngesterConfig      `koanf:"ingester"`     // optional; chunk flush timing
+	Storage       *StorageConfig       `koanf:"storage"`  // optional; Akave O3 when set
+	Ingester      *IngesterConfig      `koanf:"ingester"` // optional; chunk flush timing
 }
 
 // IngesterConfig controls when in-memory chunks are flushed to O3.
 type IngesterConfig struct {
 	ChunkIdleSeconds int `koanf:"chunk_idle_seconds"` // flush after this many seconds with no new logs; 0 = use default (30 min)
-	ChunkMaxEntries  int `koanf:"chunk_max_entries"` // close chunk after this many entries; 0 = use default (10000)
+	ChunkMaxEntries  int `koanf:"chunk_max_entries"`  // close chunk after this many entries; 0 = use default (10000)
 }
 
 // StorageConfig holds storage backends (e.g. Akave O3).
@@ -33,9 +33,9 @@ type StorageConfig struct {
 
 // O3Config is S3-compatible config for Akave O3 (https://o3-rc2.akave.xyz or similar).
 type O3Config struct {
-	Endpoint  string `koanf:"endpoint"`   // e.g. https://o3-rc2.akave.xyz
-	Bucket    string `koanf:"bucket"`     // bucket name
-	Region    string `koanf:"region"`     // e.g. us-east-1
+	Endpoint  string `koanf:"endpoint"` // e.g. https://o3-rc2.akave.xyz
+	Bucket    string `koanf:"bucket"`   // bucket name
+	Region    string `koanf:"region"`   // e.g. us-east-1
 	AccessKey string `koanf:"access_key"`
 	SecretKey string `koanf:"secret_key"`
 }

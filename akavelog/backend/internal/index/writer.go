@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	defaultIndexBatchSize   = 100
+	defaultIndexBatchSize     = 100
 	defaultIndexFlushInterval = 30 * time.Second
 )
 
@@ -30,13 +30,13 @@ type Writer interface {
 
 // O3Writer implements Writer by buffering entries and writing NDJSON batches to O3.
 type O3Writer struct {
-	client   *storage.O3Client
+	client    *storage.O3Client
 	batchSize int
 	interval  time.Duration
-	mu       sync.Mutex
-	buf      []Entry
-	stop     chan struct{}
-	done     chan struct{}
+	mu        sync.Mutex
+	buf       []Entry
+	stop      chan struct{}
+	done      chan struct{}
 }
 
 // O3WriterConfig configures the O3 index writer.

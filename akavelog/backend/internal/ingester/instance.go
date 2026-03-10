@@ -9,9 +9,9 @@ import (
 
 // Instance holds streams for one tenant.
 type Instance struct {
-	tenant string
-	config StreamConfig
-	mu     sync.RWMutex
+	tenant  string
+	config  StreamConfig
+	mu      sync.RWMutex
 	streams map[string]*Stream // key = chunk.StreamID(labels)
 	onChunk func(tenant string, labels map[string]string, desc *chunkDesc)
 }
