@@ -53,47 +53,51 @@ func (h *QueryHandler) Handle(c echo.Context) error {
 //
 // GET /query/stream?tenant=&service=&levels=error,warn&keyword=&from=RFC3339&to=RFC3339&limit=100
 func (h *QueryHandler) HandleSSE(c echo.Context) error {
-	req, err := parseSSEParams(c)
-	if err != nil {
-		return response.BadRequest(c, "invalid query params", err.Error())
-	}
+    req, err := parseSSEParams(c)
+    if err != nil {
+        return response.BadRequest(c, "invalid query params", err.Error())
+    }
 
-	w := c.Response().Writer
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no") // disable nginx buffering
-	c.Response().WriteHeader(http.StatusOK)
+    w := c.Response().Writer
+    w.Header().Set("Content-Type", "text/event-stream")
+    w.Header().Set("Cache-Control", "no-cache")
+    w.Header().Set("Connection", "keep-alive")
+    w.Header().Set("X-Accel-Buffering", "no")
+    c.Response().WriteHeader(http.StatusOK)
 
-	flusher, canFlush := w.(http.Flusher)
+    flusher, canFlush := w.(http.Flusher)
 
-	resp, err := h.engine.Query(c.Request().Context(), req)
-	if err != nil {
-		writeSSEEvent(w, "error", `{"error":"`+jsonEscape(err.Error())+`"}`)
-		if canFlush {
-			flusher.Flush()
-		}
-		return nil
-	}
+    flush := func() {
+        if canFlush {
+            flusher.Flush()
+        }
+    }
 
-	for i := range resp.Results {
-		b, err := json.Marshal(resp.Results[i])
-		if err != nil {
-			continue
-		}
-		writeSSEEvent(w, "log", string(b))
-		if canFlush {
-			flusher.Flush()
-		}
-	}
+    count, truncated, err := h.engine.QueryStream(
+        c.Request().Context(),
+        req,
+        func(entry model.QueryResultEntry) error {
+            b, err := json.Marshal(entry)
+            if err != nil {
+                return nil // skip un-marshallable entry, don't abort
+            }
+            writeSSEEvent(w, "log", string(b))
+            flush()
+            return nil
+        },
+    )
 
-	writeSSEEvent(w, "done",
-		fmt.Sprintf(`{"count":%d,"truncated":%s}`, resp.Count, boolStr(resp.Truncated)),
-	)
-	if canFlush {
-		flusher.Flush()
-	}
-	return nil
+    if err != nil {
+        writeSSEEvent(w, "error", `{"error":"`+jsonEscape(err.Error())+`"}`)
+        flush()
+        return nil
+    }
+
+    writeSSEEvent(w, "done",
+        fmt.Sprintf(`{"count":%d,"truncated":%s}`, count, boolStr(truncated)),
+    )
+    flush()
+    return nil
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
