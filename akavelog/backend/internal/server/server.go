@@ -10,18 +10,21 @@ import (
 	"strings"
 	"time"
 
-	"github.com/akave-ai/akavelog/internal/chunk"
-	"github.com/akave-ai/akavelog/internal/config"
-	"github.com/akave-ai/akavelog/internal/distributor"
-	"github.com/akave-ai/akavelog/internal/index"
-	"github.com/akave-ai/akavelog/internal/ingester"
-	"github.com/akave-ai/akavelog/internal/model"
-	"github.com/akave-ai/akavelog/internal/repository"
-	"github.com/akave-ai/akavelog/internal/response"
-	"github.com/akave-ai/akavelog/internal/storage"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
+
+	"github.com/akave-ai/akavelog/internal/chunk"
+	"github.com/akave-ai/akavelog/internal/config"
+	"github.com/akave-ai/akavelog/internal/distributor"
+	"github.com/akave-ai/akavelog/internal/handler"
+	"github.com/akave-ai/akavelog/internal/index"
+	"github.com/akave-ai/akavelog/internal/ingester"
+	"github.com/akave-ai/akavelog/internal/model"
+	"github.com/akave-ai/akavelog/internal/query"
+	"github.com/akave-ai/akavelog/internal/repository"
+	"github.com/akave-ai/akavelog/internal/response"
+	"github.com/akave-ai/akavelog/internal/storage"
 )
 
 // Server holds the Echo app and dependencies.
@@ -263,6 +266,20 @@ func New(cfg *config.Config, pool *pgxpool.Pool) *Server {
 		}
 		return response.OK(c, map[string]any{"key": key, "content": content, "encoding": encoding}, "")
 	})
+
+	// ── Phase 5: Query Engine ─────────────────────────────────────────────────
+	if o3Client != nil && pool != nil {
+		queryEngine := query.New(repository.NewLogBatchRepository(pool), o3Client)
+		queryHandler := handler.NewQueryHandler(queryEngine)
+
+		// POST /query — full result set as JSON
+		e.POST("/query", queryHandler.Handle)
+
+		// GET /query/stream — Server-Sent Events stream
+		e.GET("/query/stream", queryHandler.HandleSSE)
+
+		log.Printf("[server] query engine enabled: POST /query, GET /query/stream")
+	}
 
 	return &Server{
 		Echo:         e,
