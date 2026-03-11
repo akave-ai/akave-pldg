@@ -11,8 +11,8 @@ import (
 )
 
 // LogBatchRepository persists and retrieves log_batches metadata records.
-// It is the write side of the metadata index (Phase 4) and the read side of the query
-// engine (Phase 5). All methods are safe for concurrent use.
+// Write side: Phase 4 (ingester calls Insert after each O3 upload).
+// Read side:  Phase 5 (query engine calls ListByFilter to discover O3 keys).
 type LogBatchRepository struct {
 	pool *pgxpool.Pool
 }
@@ -23,9 +23,7 @@ func NewLogBatchRepository(pool *pgxpool.Pool) *LogBatchRepository {
 }
 
 // Insert writes one log_batches row after a successful O3 chunk upload.
-// It is intentionally lightweight: no transaction needed because the O3 upload
-// has already committed; if this insert fails the chunk is still safe in O3
-// (the O3 Progress index is the fallback). Callers should log the error and continue.
+// Non-transactional by design: if this fails the chunk is still safe in O3.
 func (r *LogBatchRepository) Insert(ctx context.Context, p logbatches.InsertParams) error {
 	if p.Tenant == "" {
 		p.Tenant = "default"
@@ -54,16 +52,16 @@ func (r *LogBatchRepository) Insert(ctx context.Context, p logbatches.InsertPara
 			($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 	`
 	_, err = r.pool.Exec(ctx, q,
-		p.ProjectID,   // $1  UUID | NULL
-		p.Tenant,      // $2  TEXT
-		p.StreamID,    // $3  TEXT
-		p.Service,     // $4  TEXT
-		p.TsStart,     // $5  TIMESTAMPTZ
-		p.TsEnd,       // $6  TIMESTAMPTZ
-		levels,        // $7  TEXT[]
-		tagsJSON,      // $8  JSONB
-		p.O3ObjectKey, // $9  TEXT
-		p.EntryCount,  // $10 INT
+		p.ProjectID,
+		p.Tenant,
+		p.StreamID,
+		p.Service,
+		p.TsStart,
+		p.TsEnd,
+		levels,
+		tagsJSON,
+		p.O3ObjectKey,
+		p.EntryCount,
 	)
 	if err != nil {
 		return fmt.Errorf("log_batch insert: %w", err)
@@ -71,8 +69,8 @@ func (r *LogBatchRepository) Insert(ctx context.Context, p logbatches.InsertPara
 	return nil
 }
 
-// ListByTimeRange returns all log_batches rows whose time range overlaps [from, to]
-// for the given tenant. Used by the Phase 5 query engine to discover O3 object keys.
+// ListByTimeRange returns all log_batches rows whose time range overlaps [from, to].
+// Used by GET /index/batches (debug/ops endpoint).
 func (r *LogBatchRepository) ListByTimeRange(
 	ctx context.Context,
 	p logbatches.QueryParams,
@@ -113,6 +111,65 @@ func (r *LogBatchRepository) ListByTimeRange(
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("log_batches rows: %w", err)
+	}
+	return out, nil
+}
+
+// ListByFilter returns log_batches rows matching the given filters.
+// Used by the Phase 5 query engine. Service and Levels are optional.
+func (r *LogBatchRepository) ListByFilter(
+	ctx context.Context,
+	p logbatches.QueryParams,
+) ([]logbatches.LogBatch, error) {
+	if p.Tenant == "" {
+		p.Tenant = "default"
+	}
+	if p.TsEnd.IsZero() {
+		p.TsEnd = time.Now().UTC()
+	}
+
+	args := []any{p.Tenant, p.TsStart, p.TsEnd}
+	where := `
+		WHERE  tenant   = $1
+		  AND  ts_start <= $3
+		  AND  ts_end   >= $2`
+
+	if p.Service != "" {
+		args = append(args, p.Service)
+		where += fmt.Sprintf("\n\t\t  AND  service  = $%d", len(args))
+	}
+
+	if len(p.Levels) > 0 {
+		args = append(args, p.Levels)
+		where += fmt.Sprintf("\n\t\t  AND  levels   && $%d::text[]", len(args))
+	}
+
+	q := `
+		SELECT id, project_id, tenant, stream_id, service,
+		       ts_start, ts_end, levels, tags, o3_object_key, entry_count, created_at
+		FROM   log_batches` + where + `
+		ORDER  BY ts_start ASC`
+
+	rows, err := r.pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("log_batches filter: %w", err)
+	}
+	defer rows.Close()
+
+	var out []logbatches.LogBatch
+	for rows.Next() {
+		var b logbatches.LogBatch
+		if err := rows.Scan(
+			&b.ID, &b.ProjectID, &b.Tenant, &b.StreamID, &b.Service,
+			&b.TsStart, &b.TsEnd, &b.Levels, &b.Tags, &b.O3ObjectKey,
+			&b.EntryCount, &b.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("log_batches filter scan: %w", err)
+		}
+		out = append(out, b)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("log_batches filter rows: %w", err)
 	}
 	return out, nil
 }
