@@ -205,3 +205,126 @@ func TestLogBatchRepository_NilLevels(t *testing.T) {
 	})
 	require.NoError(t, err, "nil levels should be coerced to empty array")
 }
+
+func TestLogBatchRepository_ListByFilter_NoFilters(t *testing.T) {
+	pool := testPool(t)
+	repo := repository.NewLogBatchRepository(pool)
+
+	streamID := "test-filter-nofilter-001"
+	t.Cleanup(func() { cleanupBatches(t, pool, streamID) })
+
+	now := time.Now().UTC().Truncate(time.Second)
+	require.NoError(t, repo.Insert(context.Background(), logbatches.InsertParams{
+		Tenant:      "default",
+		StreamID:    streamID,
+		Service:     "svc-a",
+		TsStart:     now.Add(-5 * time.Minute),
+		TsEnd:       now,
+		Levels:      []string{"info"},
+		Tags:        map[string]string{"job": "svc-a"},
+		O3ObjectKey: "chunks/default/" + streamID + "/1_2.json.gz",
+		EntryCount:  3,
+	}))
+
+	results, err := repo.ListByFilter(context.Background(), logbatches.QueryParams{
+		Tenant:  "default",
+		TsStart: now.Add(-10 * time.Minute),
+		TsEnd:   now.Add(time.Minute),
+	})
+	require.NoError(t, err)
+
+	found := false
+	for _, b := range results {
+		if b.StreamID == streamID {
+			found = true
+		}
+	}
+	assert.True(t, found, "inserted batch should appear in results")
+}
+
+func TestLogBatchRepository_ListByFilter_ServiceFilter(t *testing.T) {
+	pool := testPool(t)
+	repo := repository.NewLogBatchRepository(pool)
+
+	streamID := "test-filter-service-001"
+	t.Cleanup(func() { cleanupBatches(t, pool, streamID) })
+
+	now := time.Now().UTC().Truncate(time.Second)
+
+	// Insert two batches with different services.
+	for _, svc := range []string{"auth-api", "payment-api"} {
+		require.NoError(t, repo.Insert(context.Background(), logbatches.InsertParams{
+			Tenant:      "default",
+			StreamID:    streamID,
+			Service:     svc,
+			TsStart:     now.Add(-5 * time.Minute),
+			TsEnd:       now,
+			Levels:      []string{"info"},
+			Tags:        map[string]string{"job": svc},
+			O3ObjectKey: "chunks/default/" + streamID + "/" + svc + ".json.gz",
+			EntryCount:  1,
+		}))
+	}
+
+	results, err := repo.ListByFilter(context.Background(), logbatches.QueryParams{
+		Tenant:  "default",
+		Service: "auth-api",
+		TsStart: now.Add(-10 * time.Minute),
+		TsEnd:   now.Add(time.Minute),
+	})
+	require.NoError(t, err)
+
+	for _, b := range results {
+		if b.StreamID == streamID {
+			assert.Equal(t, "auth-api", b.Service, "only auth-api should be returned")
+		}
+	}
+}
+
+func TestLogBatchRepository_ListByFilter_LevelsFilter(t *testing.T) {
+	pool := testPool(t)
+	repo := repository.NewLogBatchRepository(pool)
+
+	streamID := "test-filter-levels-001"
+	t.Cleanup(func() { cleanupBatches(t, pool, streamID) })
+
+	now := time.Now().UTC().Truncate(time.Second)
+
+	require.NoError(t, repo.Insert(context.Background(), logbatches.InsertParams{
+		Tenant:      "default",
+		StreamID:    streamID,
+		Service:     "svc",
+		TsStart:     now.Add(-5 * time.Minute),
+		TsEnd:       now,
+		Levels:      []string{"error"},
+		Tags:        map[string]string{"job": "svc"},
+		O3ObjectKey: "chunks/default/" + streamID + "/error.json.gz",
+		EntryCount:  1,
+	}))
+	require.NoError(t, repo.Insert(context.Background(), logbatches.InsertParams{
+		Tenant:      "default",
+		StreamID:    streamID,
+		Service:     "svc",
+		TsStart:     now.Add(-4 * time.Minute),
+		TsEnd:       now,
+		Levels:      []string{"info"},
+		Tags:        map[string]string{"job": "svc"},
+		O3ObjectKey: "chunks/default/" + streamID + "/info.json.gz",
+		EntryCount:  1,
+	}))
+
+	results, err := repo.ListByFilter(context.Background(), logbatches.QueryParams{
+		Tenant:  "default",
+		Levels:  []string{"error"},
+		TsStart: now.Add(-10 * time.Minute),
+		TsEnd:   now.Add(time.Minute),
+	})
+	require.NoError(t, err)
+
+	for _, b := range results {
+		if b.StreamID == streamID {
+			assert.Contains(t, b.O3ObjectKey, "error",
+				"only error-level batch should be returned")
+		}
+	}
+}
