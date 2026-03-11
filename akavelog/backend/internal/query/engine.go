@@ -275,3 +275,54 @@ func normalise(req model.QueryRequest) model.QueryRequest {
 	}
 	return req
 }
+
+// QueryStream executes a query and calls onEntry for each matching log entry
+// as soon as it is found, without buffering all results first.
+// onEntry returning an error (e.g. client disconnect) aborts the stream early.
+func (e *Engine) QueryStream(
+    ctx context.Context,
+    req model.QueryRequest,
+    onEntry func(entry model.QueryResultEntry) error,
+) (count int, truncated bool, err error) {
+    req = normalise(req)
+
+    batches, err := e.lookup.ListByFilter(ctx, logbatches.QueryParams{
+        Tenant:  req.Tenant,
+        Service: req.Service,
+        Levels:  req.Levels,
+        TsStart: req.TsStart,
+        TsEnd:   req.TsEnd,
+    })
+    if err != nil {
+        return 0, false, fmt.Errorf("query metadata lookup: %w", err)
+    }
+
+    for _, batch := range batches {
+        if count >= req.Limit {
+            truncated = true
+            break
+        }
+
+        entries, err := e.fetchAndFilter(ctx, batch, req)
+        if err != nil {
+            log.Printf("[query] stream fetch/filter %s: %v", batch.O3ObjectKey, err)
+            continue
+        }
+
+        for _, entry := range entries {
+            if count >= req.Limit {
+                truncated = true
+                break
+            }
+            if err := onEntry(entry); err != nil {
+                // Client disconnected or handler signalled stop.
+                return count, false, nil
+            }
+            count++
+        }
+    }
+
+    return count, truncated, nil
+}
+
+
