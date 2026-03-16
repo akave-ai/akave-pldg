@@ -18,7 +18,7 @@ type RecentLogsStore struct {
 
 type recentLogEntry struct {
 	Entry    model.LogEntry `json:"entry"`
-	Received time.Time     `json:"received_at"`
+	Received time.Time      `json:"received_at"`
 }
 
 func newRecentLogsStore() *RecentLogsStore {
@@ -61,12 +61,12 @@ func (s *RecentLogsStore) GetRecent() []recentLogEntry {
 
 // UploadStatusStore holds last flush info for the demo UI.
 type UploadStatusStore struct {
-	mu         sync.RWMutex
-	LastAt     time.Time `json:"last_upload_at"`
-	LastKey    string    `json:"last_upload_key"`
-	LastCount  int       `json:"last_upload_count"`
-	Pending    int       `json:"pending_count"`
-	BatcherOn  bool      `json:"batcher_enabled"`
+	mu        sync.RWMutex
+	LastAt    time.Time `json:"last_upload_at"`
+	LastKey   string    `json:"last_upload_key"`
+	LastCount int       `json:"last_upload_count"`
+	Pending   int       `json:"pending_count"`
+	BatcherOn bool      `json:"batcher_enabled"`
 }
 
 func (u *UploadStatusStore) SetLastFlush(count int, key string) {

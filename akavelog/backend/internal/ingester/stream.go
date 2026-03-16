@@ -20,12 +20,12 @@ type chunkDesc struct {
 
 // Stream holds labels and chunks for one stream (keyed by labels).
 type Stream struct {
-	labels   map[string]string
-	mu       sync.Mutex
-	current  *chunkDesc
-	pending  []*chunkDesc // closed chunks waiting for flush
-	config   StreamConfig
-	onChunk  func(*chunkDesc) // enqueue for flush when closed
+	labels  map[string]string
+	mu      sync.Mutex
+	current *chunkDesc
+	pending []*chunkDesc // closed chunks waiting for flush
+	config  StreamConfig
+	onChunk func(*chunkDesc) // enqueue for flush when closed
 }
 
 // StreamConfig controls when chunks are closed and flushed.

@@ -9,7 +9,7 @@ type PushRequest struct {
 // StreamRef is one stream: labels + entries.
 type StreamRef struct {
 	Labels  map[string]string `json:"stream"`
-	Entries []Entry            `json:"entries"`
+	Entries []Entry           `json:"entries"`
 }
 
 // Entry is a single log line: timestamp (nanoseconds) and line text.
