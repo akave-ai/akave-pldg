@@ -126,3 +126,126 @@ export async function getUploadRaw(key: string): Promise<RawObjectResponse> {
     `${API}/uploads/raw?key=${encodeURIComponent(key)}`
   );
 }
+
+// ── Phase 5: Query Engine ──────────────────────────────────────────────────
+
+export type QueryResultEntry = {
+  ts_ns: number;
+  timestamp: string; // RFC3339Nano
+  service: string;
+  level: string;
+  line: string;
+  labels: Record<string, string>;
+  o3_object_key: string;
+};
+
+export type QueryResponse = {
+  results: QueryResultEntry[];
+  count: number;
+  truncated: boolean;
+};
+
+export type QueryRequest = {
+  tenant?: string;
+  service?: string;
+  levels?: string[];
+  keyword?: string;
+  time_start?: string; // RFC3339
+  time_end?: string;   // RFC3339
+  limit?: number;
+};
+
+/** POST /query — full buffered result set */
+export async function queryLogs(req: QueryRequest): Promise<QueryResponse> {
+  const r = await fetch(`${API}/query`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(req),
+  });
+  if (!r.ok) {
+    const body = await r.json().catch(() => ({}));
+    const err = body as Partial<APIError>;
+    throw new Error(err?.message || err?.error || r.statusText || 'Query failed');
+  }
+  return r.json() as Promise<QueryResponse>;
+}
+
+export type SSEDoneEvent = { count: number; truncated: boolean };
+export type SSEErrorEvent = { error: string };
+
+/**
+ * GET /query/stream — Server-Sent Events streaming query.
+ * Calls onEntry for each log entry as it arrives.
+ * Calls onDone when the stream ends.
+ * Returns an AbortController so the caller can cancel.
+ */
+export function streamLogs(
+  req: QueryRequest,
+  onEntry: (entry: QueryResultEntry) => void,
+  onDone: (summary: SSEDoneEvent) => void,
+  onError: (err: string) => void,
+): AbortController {
+  const ctrl = new AbortController();
+
+  const params = new URLSearchParams();
+  if (req.tenant) params.set('tenant', req.tenant);
+  if (req.service) params.set('service', req.service);
+  if (req.levels?.length) params.set('levels', req.levels.join(','));
+  if (req.keyword) params.set('keyword', req.keyword);
+  if (req.time_start) params.set('from', req.time_start);
+  if (req.time_end) params.set('to', req.time_end);
+  if (req.limit) params.set('limit', String(req.limit));
+
+  const url = `${API}/query/stream?${params.toString()}`;
+
+  (async () => {
+    try {
+      const resp = await fetch(url, { signal: ctrl.signal });
+      if (!resp.ok || !resp.body) {
+        onError(`HTTP ${resp.status}: ${resp.statusText}`);
+        return;
+      }
+
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split('\n\n');
+        buffer = parts.pop() ?? '';
+
+        for (const block of parts) {
+          const lines = block.split('\n');
+          let eventType = '';
+          let data = '';
+
+          for (const line of lines) {
+            if (line.startsWith('event: ')) eventType = line.slice(7).trim();
+            if (line.startsWith('data: ')) data = line.slice(6).trim();
+          }
+
+          if (!data) continue;
+
+          try {
+            const parsed = JSON.parse(data);
+            if (eventType === 'log') onEntry(parsed as QueryResultEntry);
+            else if (eventType === 'done') onDone(parsed as SSEDoneEvent);
+            else if (eventType === 'error') onError((parsed as SSEErrorEvent).error);
+          } catch {
+            // ignore malformed SSE
+          }
+        }
+      }
+    } catch (e) {
+      if ((e as Error).name !== 'AbortError') {
+        onError((e as Error).message || 'Stream failed');
+      }
+    }
+  })();
+
+  return ctrl;
+}
