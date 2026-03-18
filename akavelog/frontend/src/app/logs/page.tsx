@@ -248,7 +248,6 @@ export default function LogsPage() {
         <span className="text-[var(--accent)] font-semibold tracking-wide text-sm">LOG EXPLORER</span>
         <div className="ml-auto flex items-center gap-3 text-xs text-[var(--muted)]">
           <Link href="/uploads" className="hover:text-[var(--accent)] transition-colors">O3 Uploads</Link>
-          <Link href="/stored"  className="hover:text-[var(--accent)] transition-colors">Stored Data</Link>
         </div>
       </header>
 

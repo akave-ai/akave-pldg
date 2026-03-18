@@ -125,7 +125,6 @@ export default function LogInserterPage() {
         <nav className="flex items-center gap-4 ml-2">
           <Link href="/logs"    className="text-xs text-[var(--muted)] hover:text-[var(--accent)] transition-colors">Log Explorer →</Link>
           <Link href="/uploads" className="text-xs text-[var(--muted)] hover:text-[var(--accent)] transition-colors">O3 Uploads →</Link>
-          <Link href="/stored"  className="text-xs text-[var(--muted)] hover:text-[var(--accent)] transition-colors">Stored Data →</Link>
         </nav>
         <span className="ml-auto text-[10px] text-[var(--muted)] font-mono">
           POST /akavelog/api/v1/push

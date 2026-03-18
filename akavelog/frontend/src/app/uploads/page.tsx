@@ -1,8 +1,8 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
-import { getUploadContent, getUploads, type O3ObjectInfo, type StoredLogEntry } from '@/lib/api';
+import { getUploadContent, getUploadRaw, getUploads, type O3ObjectInfo, type StoredLogEntry } from '@/lib/api';
 
 export default function UploadsPage() {
   const [objects, setObjects] = useState<O3ObjectInfo[]>([]);
@@ -14,12 +14,17 @@ export default function UploadsPage() {
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [loadAllLogs, setLoadAllLogs] = useState(false);
 
+  // Raw view state
+  const [expandedKey, setExpandedKey] = useState<string | null>(null);
+  const [rawContent, setRawContent] = useState<string | null>(null);
+  const [rawLoading, setRawLoading] = useState(false);
+
   const loadUploads = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
       const { objects: list } = await getUploads(prefix || undefined);
-      setObjects(list);
+      setObjects(list.reverse());
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load uploads');
       setObjects([]);
@@ -70,6 +75,25 @@ export default function UploadsPage() {
     }
   }, [objects]);
 
+  const toggleExpand = useCallback(async (key: string) => {
+    if (expandedKey === key) {
+      setExpandedKey(null);
+      setRawContent(null);
+      return;
+    }
+    setExpandedKey(key);
+    setRawContent(null);
+    setRawLoading(true);
+    try {
+      const res = await getUploadRaw(key);
+      setRawContent(res.content);
+    } catch (e) {
+      setRawContent((e instanceof Error ? e.message : 'Failed to load raw content') + '\n');
+    } finally {
+      setRawLoading(false);
+    }
+  }, [expandedKey]);
+
   const formatSize = (bytes: number) => {
     if (bytes < 1024) return `${bytes} B`;
     if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -91,7 +115,7 @@ export default function UploadsPage() {
           </h1>
         </div>
         <p className="text-sm text-[var(--muted)] mt-1">
-          Log batches in O3. View logs from a batch or load all stored logs.
+          Log batches in O3. View logs from a batch, see raw O3 data, or load all stored logs.
         </p>
       </header>
 
@@ -146,6 +170,7 @@ export default function UploadsPage() {
             <table className="w-full text-sm">
               <thead>
                 <tr className="text-left text-[var(--muted)] border-b border-[var(--border)]">
+                  <th className="w-8 pb-2 pr-2" aria-label="Expand" />
                   <th className="pb-2 pr-4 font-medium">Key</th>
                   <th className="pb-2 pr-4 font-medium">Size</th>
                   <th className="pb-2 pr-4 font-medium">Last modified</th>
@@ -153,34 +178,65 @@ export default function UploadsPage() {
                 </tr>
               </thead>
               <tbody>
-                {objects.map((obj) => (
-                  <tr
-                    key={obj.key}
-                    className="border-b border-[var(--border)]/50"
-                  >
-                    <td className="py-2 pr-4 font-mono text-[var(--accent)] break-all">
-                      {obj.key}
-                    </td>
-                    <td className="py-2 pr-4 text-[var(--muted)]">
-                      {formatSize(obj.size)}
-                    </td>
-                    <td className="py-2 pr-4 text-[var(--muted)]">
-                      {obj.last_modified
-                        ? new Date(obj.last_modified).toLocaleString()
-                        : '—'}
-                    </td>
-                    <td className="py-2">
-                      <button
-                        type="button"
-                        onClick={() => loadLogsForKey(obj.key)}
-                        disabled={logsLoading}
-                        className="text-xs text-[var(--accent)] hover:underline disabled:opacity-50"
-                      >
-                        View logs
-                      </button>
-                    </td>
-                  </tr>
-                ))}
+                {objects.map((obj) => {
+                  const isExpanded = expandedKey === obj.key;
+                  return (
+                    <React.Fragment key={obj.key}>
+                      <tr className="border-b border-[var(--border)]/50 hover:bg-[var(--border)]/20">
+                        <td className="py-2 pr-2">
+                          <button
+                            type="button"
+                            onClick={() => toggleExpand(obj.key)}
+                            disabled={rawLoading && expandedKey !== obj.key}
+                            className="p-1 rounded text-[var(--muted)] hover:bg-[var(--border)] disabled:opacity-50"
+                            aria-expanded={isExpanded}
+                            title={isExpanded ? 'Collapse' : 'View raw object'}
+                          >
+                            <span className="inline-block transition-transform" style={{ transform: isExpanded ? 'rotate(90deg)' : 'none' }}>
+                              ▶
+                            </span>
+                          </button>
+                        </td>
+                        <td className="py-2 pr-4 font-mono text-[var(--accent)] break-all">
+                          {obj.key}
+                        </td>
+                        <td className="py-2 pr-4 text-[var(--muted)]">
+                          {formatSize(obj.size)}
+                        </td>
+                        <td className="py-2 pr-4 text-[var(--muted)]">
+                          {obj.last_modified
+                            ? new Date(obj.last_modified).toLocaleString()
+                            : '—'}
+                        </td>
+                        <td className="py-2">
+                          <button
+                            type="button"
+                            onClick={() => loadLogsForKey(obj.key)}
+                            disabled={logsLoading}
+                            className="text-xs text-[var(--accent)] hover:underline disabled:opacity-50"
+                          >
+                            View logs
+                          </button>
+                        </td>
+                      </tr>
+                      {isExpanded && (
+                        <tr className="border-b border-[var(--border)]/50 bg-[var(--bg)]">
+                          <td colSpan={5} className="p-0">
+                            <div className="px-12 pb-4 pt-1">
+                              {rawLoading ? (
+                                <p className="text-sm text-[var(--muted)]">Loading raw content…</p>
+                              ) : (
+                                <pre className="text-xs font-mono overflow-auto max-h-[400px] p-4 rounded-lg bg-[#0e0e0e] border border-[var(--border)] whitespace-pre-wrap break-words text-[var(--text)]">
+                                  {rawContent ?? ''}
+                                </pre>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </React.Fragment>
+                  );
+                })}
               </tbody>
             </table>
           </div>
