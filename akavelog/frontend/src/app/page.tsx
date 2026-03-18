@@ -102,10 +102,14 @@ export default function DemoPage() {
         <header className="border-b border-[var(--border)] pb-2">
           <div className="flex items-center gap-4 flex-wrap">
             <h1 className="text-xl font-semibold text-[var(--accent)]">Akavelog Demo</h1>
-            <Link href="/uploads" className="text-sm text-[var(--muted)] hover:text-[var(--accent)]">
+            {/* ── Navigation ── */}
+            <Link href="/logs" className="text-sm text-[var(--muted)] hover:text-[var(--accent)] transition-colors">
+              Log Explorer →
+            </Link>
+            <Link href="/uploads" className="text-sm text-[var(--muted)] hover:text-[var(--accent)] transition-colors">
               View O3 uploads →
             </Link>
-            <Link href="/stored" className="text-sm text-[var(--muted)] hover:text-[var(--accent)]">
+            <Link href="/stored" className="text-sm text-[var(--muted)] hover:text-[var(--accent)] transition-colors">
               Stored data (raw) →
             </Link>
           </div>
@@ -160,7 +164,15 @@ export default function DemoPage() {
         </section>
 
         <section className="rounded-xl bg-[var(--card)] border border-[var(--border)] p-4 flex-1 min-h-[200px] flex flex-col">
-          <h2 className="text-sm font-medium text-[var(--muted)] mb-3">Incoming logs (last 200)</h2>
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-sm font-medium text-[var(--muted)]">Incoming logs (last 200)</h2>
+            <Link
+              href="/logs"
+              className="text-xs text-[var(--accent)] hover:underline transition-colors"
+            >
+              Open Log Explorer →
+            </Link>
+          </div>
           <div className="flex-1 overflow-auto rounded-lg bg-[var(--bg)] border border-[var(--border)] p-2 font-mono text-xs">
             {logs.length === 0 ? (
               <p className="text-[var(--muted)]">Logs appear here after you push. Polling every 2s.</p>
