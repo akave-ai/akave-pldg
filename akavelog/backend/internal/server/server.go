@@ -236,7 +236,10 @@ func New(cfg *config.Config, pool *pgxpool.Pool) *Server {
 		}
 		logs, err := o3Client.GetObjectLogs(c.Request().Context(), key)
 		if err != nil {
-			return response.InternalError(c, "get upload content failed", err.Error())
+			// Some historical/corrupted objects in O3 can fail to download or decode (e.g. unexpected EOF).
+			// Keep the UI functional by returning an empty payload rather than a 500.
+			log.Printf("[uploads/content] get upload content failed key=%s err=%v", key, err)
+			return response.OK(c, map[string]any{"logs": []model.LogEntry{}, "key": key}, "")
 		}
 		return response.OK(c, map[string]any{"logs": logs, "key": key}, "")
 	})
@@ -251,7 +254,9 @@ func New(cfg *config.Config, pool *pgxpool.Pool) *Server {
 		}
 		raw, err := o3Client.GetObject(c.Request().Context(), key)
 		if err != nil {
-			return response.InternalError(c, "get raw object failed", err.Error())
+			// UX: don't fail the entire UI when a single O3 object is corrupted/unreadable.
+			log.Printf("[uploads/raw] get raw object failed key=%s err=%v", key, err)
+			return response.OK(c, map[string]any{"key": key, "content": "", "encoding": "error"}, "")
 		}
 		content := string(raw)
 		encoding := "identity"
@@ -329,6 +334,12 @@ func labelsToLogEntry(labels map[string]string, tsNs int64, line string) *model.
 			}
 		}
 	}
+	level := "info"
+	if labels != nil {
+		if l := labels["level"]; l != "" {
+			level = strings.ToLower(l)
+		}
+	}
 	ts := time.Now().UTC().Format(time.RFC3339Nano)
 	if tsNs > 0 {
 		ts = time.Unix(0, tsNs).UTC().Format(time.RFC3339Nano)
@@ -336,7 +347,7 @@ func labelsToLogEntry(labels map[string]string, tsNs int64, line string) *model.
 	return &model.LogEntry{
 		Timestamp: ts,
 		Service:   service,
-		Level:     "info",
+		Level:     level,
 		Message:   line,
 		Tags:      labels,
 	}

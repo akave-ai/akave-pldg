@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/akave-ai/akavelog/internal/config"
@@ -144,9 +145,85 @@ func (c *O3Client) GetObjectLogs(ctx context.Context, key string) ([]model.LogEn
 	if err != nil {
 		return nil, fmt.Errorf("read: %w", err)
 	}
-	var entries []model.LogEntry
-	if err := json.Unmarshal(decoded, &entries); err != nil {
+
+	// Support both:
+	// 1) Legacy format: gzip JSON []model.LogEntry
+	// 2) Current format: gzip JSON {labels: {...}, entries:[{ts_ns, line}, ...]}
+	var legacy []model.LogEntry
+	if err := json.Unmarshal(decoded, &legacy); err == nil {
+		return legacy, nil
+	}
+
+	type entryPayload struct {
+		TsNs int64  `json:"ts_ns"`
+		Line string `json:"line"`
+	}
+	type chunkPayload struct {
+		Labels  map[string]string `json:"labels"`
+		Entries []entryPayload    `json:"entries"`
+	}
+
+	var payload chunkPayload
+	if err := json.Unmarshal(decoded, &payload); err != nil {
 		return nil, fmt.Errorf("json: %w", err)
 	}
-	return entries, nil
+
+	extractService := func(labels map[string]string) string {
+		service := "akavelog"
+		if labels == nil {
+			return service
+		}
+		for _, k := range []string{"job", "app", "service"} {
+			if v := labels[k]; v != "" {
+				return v
+			}
+		}
+		return service
+	}
+
+	extractLevel := func(labels map[string]string) string {
+		if labels == nil {
+			return ""
+		}
+		return labels["level"]
+	}
+
+	extractLevelFromLine := func(line string) string {
+		upper := strings.ToUpper(line)
+		for _, lvl := range []string{"FATAL", "ERROR", "WARN", "WARNING", "INFO", "DEBUG", "TRACE"} {
+			if strings.HasPrefix(upper, lvl+":") ||
+				strings.HasPrefix(upper, "["+lvl+"]") ||
+				strings.HasPrefix(upper, lvl+" ") {
+				if lvl == "WARNING" {
+					return "warn"
+				}
+				return strings.ToLower(lvl)
+			}
+		}
+		return ""
+	}
+
+	service := extractService(payload.Labels)
+	baseLevel := extractLevel(payload.Labels)
+
+	out := make([]model.LogEntry, 0, len(payload.Entries))
+	for _, e := range payload.Entries {
+		level := baseLevel
+		if l := extractLevelFromLine(e.Line); l != "" {
+			level = l
+		}
+		if level == "" {
+			level = "info"
+		}
+
+		out = append(out, model.LogEntry{
+			Timestamp: time.Unix(0, e.TsNs).UTC().Format(time.RFC3339Nano),
+			Service:   service,
+			Level:     level,
+			Message:   e.Line,
+			Tags:      payload.Labels,
+		})
+	}
+
+	return out, nil
 }

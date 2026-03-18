@@ -139,7 +139,7 @@ export default function StoredDataPage() {
             href="/"
             className="text-sm text-[var(--muted)] hover:text-[var(--accent)]"
           >
-            ← Demo
+            ← Inserter
           </Link>
           <h1 className="text-xl font-semibold text-[var(--accent)]">
             Stored data
