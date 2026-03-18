@@ -2,8 +2,8 @@ import type { Metadata } from 'next';
 import './globals.css';
 
 export const metadata: Metadata = {
-  title: 'Akavelog Demo',
-  description: 'Create HTTP inputs, view incoming logs, and monitor uploads to Akave O3',
+  title: 'Akavelog',
+  description: 'Insert logs, explore them, and view stored data in Akave O3',
 };
 
 export default function RootLayout({
