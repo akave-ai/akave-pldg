@@ -19,7 +19,7 @@ func testPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
-		dsn = "postgres://akavelog:akavelog@localhost:5432/akavelog?sslmode=disable"
+		dsn = "postgres://akavelog:akavelog@localhost:5433/akavelog?sslmode=disable"
 	}
 	pool, err := pgxpool.New(context.Background(), dsn)
 	require.NoError(t, err, "connect to test DB")
