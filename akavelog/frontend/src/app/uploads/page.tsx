@@ -8,7 +8,7 @@ export default function UploadsPage() {
   const [objects, setObjects] = useState<O3ObjectInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [prefix, setPrefix] = useState('logs/');
+  const [prefix, setPrefix] = useState('chunks/');
   const [storedLogs, setStoredLogs] = useState<StoredLogEntry[]>([]);
   const [logsLoading, setLogsLoading] = useState(false);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
@@ -84,7 +84,7 @@ export default function UploadsPage() {
             href="/"
             className="text-sm text-[var(--muted)] hover:text-[var(--accent)]"
           >
-            ← Demo
+            ← Inserter
           </Link>
           <h1 className="text-xl font-semibold text-[var(--accent)]">
             Uploads to O3
@@ -107,7 +107,7 @@ export default function UploadsPage() {
           type="text"
           value={prefix}
           onChange={(e) => setPrefix(e.target.value)}
-          placeholder="logs/"
+          placeholder="chunks/"
           className="rounded-lg bg-[var(--card)] border border-[var(--border)] px-3 py-2 text-sm w-48 font-mono"
         />
         <button

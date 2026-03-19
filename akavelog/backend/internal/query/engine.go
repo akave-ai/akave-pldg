@@ -19,7 +19,7 @@ import (
 const (
 	defaultLimit    = 100
 	maxLimit        = 1000
-	defaultLookback = time.Hour
+	defaultLookback = 30 * 24 * time.Hour // 30 days
 )
 
 // BatchLookup is the interface the engine uses to find candidate O3 object keys.
@@ -159,6 +159,11 @@ func (e *Engine) fetchAndFilter(
 			O3ObjectKey: batch.O3ObjectKey,
 		})
 	}
+	// Reverse so entries within the chunk are newest-first,
+	// consistent with the DESC batch ordering from the SQL layer.
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
 	return out, nil
 }
 
@@ -182,7 +187,7 @@ func matchesEntry(ce chunkEntry, labels map[string]string, req model.QueryReques
 	if req.TsStart.UnixNano() > 0 && ce.TsNs < req.TsStart.UnixNano() {
 		return false
 	}
-	if ce.TsNs > req.TsEnd.UnixNano() {
+	if ce.TsNs > req.TsEnd.Add(time.Second).UnixNano() {
 		return false
 	}
 
@@ -280,49 +285,47 @@ func normalise(req model.QueryRequest) model.QueryRequest {
 // as soon as it is found, without buffering all results first.
 // onEntry returning an error (e.g. client disconnect) aborts the stream early.
 func (e *Engine) QueryStream(
-    ctx context.Context,
-    req model.QueryRequest,
-    onEntry func(entry model.QueryResultEntry) error,
+	ctx context.Context,
+	req model.QueryRequest,
+	onEntry func(entry model.QueryResultEntry) error,
 ) (count int, truncated bool, err error) {
-    req = normalise(req)
+	req = normalise(req)
 
-    batches, err := e.lookup.ListByFilter(ctx, logbatches.QueryParams{
-        Tenant:  req.Tenant,
-        Service: req.Service,
-        Levels:  req.Levels,
-        TsStart: req.TsStart,
-        TsEnd:   req.TsEnd,
-    })
-    if err != nil {
-        return 0, false, fmt.Errorf("query metadata lookup: %w", err)
-    }
+	batches, err := e.lookup.ListByFilter(ctx, logbatches.QueryParams{
+		Tenant:  req.Tenant,
+		Service: req.Service,
+		Levels:  req.Levels,
+		TsStart: req.TsStart,
+		TsEnd:   req.TsEnd,
+	})
+	if err != nil {
+		return 0, false, fmt.Errorf("query metadata lookup: %w", err)
+	}
 
-    for _, batch := range batches {
-        if count >= req.Limit {
-            truncated = true
-            break
-        }
+	for _, batch := range batches {
+		if count >= req.Limit {
+			truncated = true
+			break
+		}
 
-        entries, err := e.fetchAndFilter(ctx, batch, req)
-        if err != nil {
-            log.Printf("[query] stream fetch/filter %s: %v", batch.O3ObjectKey, err)
-            continue
-        }
+		entries, err := e.fetchAndFilter(ctx, batch, req)
+		if err != nil {
+			log.Printf("[query] stream fetch/filter %s: %v", batch.O3ObjectKey, err)
+			continue
+		}
 
-        for _, entry := range entries {
-            if count >= req.Limit {
-                truncated = true
-                break
-            }
-            if err := onEntry(entry); err != nil {
-                // Client disconnected or handler signalled stop.
-                return count, false, nil
-            }
-            count++
-        }
-    }
+		for _, entry := range entries {
+			if count >= req.Limit {
+				truncated = true
+				break
+			}
+			if err := onEntry(entry); err != nil {
+				// Client disconnected or handler signalled stop.
+				return count, false, nil
+			}
+			count++
+		}
+	}
 
-    return count, truncated, nil
+	return count, truncated, nil
 }
-
-

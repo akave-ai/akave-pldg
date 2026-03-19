@@ -3,32 +3,36 @@
 import { useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
 import {
-  getPushUrl,
-  getRecentLogs,
   getUploadStatus,
+  getRecentLogs,
   sendAkavelogPush,
   type AkavelogStream,
   type LogEntry,
-  type UploadStatus as UploadStatusType,
+  type UploadStatus,
 } from '@/lib/api';
 
-export default function DemoPage() {
-  const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [uploadStatus, setUploadStatus] = useState<UploadStatusType | null>(null);
+const LEVELS = ['error', 'warn', 'info', 'debug', 'fatal', 'trace'] as const;
+
+const LEVEL_COLORS: Record<string, string> = {
+  error: '#f87171',
+  fatal: '#fca5a5',
+  warn:  '#facc15',
+  info:  '#22d3ee',
+  debug: '#a1a1aa',
+  trace: '#c084fc',
+};
+
+export default function LogInserterPage() {
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [logMessage, setLogMessage] = useState('');
-  const [pushMs, setPushMs] = useState<number | null>(null);
-  const [copyCurlDone, setCopyCurlDone] = useState(false);
+  const [success, setSuccess] = useState(false);
 
-  const loadLogs = useCallback(async () => {
-    try {
-      const { logs: list } = await getRecentLogs();
-      setLogs(list);
-    } catch {
-      // ignore
-    }
-  }, []);
+  const [serviceName, setServiceName] = useState('akavelog');
+  const [level, setLevel] = useState<(typeof LEVELS)[number]>('info');
+  const [logMessage, setLogMessage] = useState('');
+
+  const [uploadStatus, setUploadStatus] = useState<UploadStatus | null>(null);
+  const [recentLogs, setRecentLogs] = useState<LogEntry[]>([]);
 
   const loadStatus = useCallback(async () => {
     try {
@@ -40,35 +44,69 @@ export default function DemoPage() {
   }, []);
 
   useEffect(() => {
-    loadLogs();
     loadStatus();
-  }, [loadLogs, loadStatus]);
+    const t = setInterval(loadStatus, 2000);
+    return () => clearInterval(t);
+  }, [loadStatus]);
+
+  const loadRecent = useCallback(async () => {
+    try {
+      const { logs } = await getRecentLogs();
+      setRecentLogs(logs);
+    } catch { /* ignore */ }
+  }, []);
 
   useEffect(() => {
-    const t = setInterval(() => {
-      loadLogs();
-      loadStatus();
-    }, 2000);
+    loadRecent();
+    const t = setInterval(loadRecent, 2000);
     return () => clearInterval(t);
-  }, [loadLogs, loadStatus]);
+  }, [loadRecent]);
+
+  // ── Metrics ─────────────────────────────────────────────────────────────────
+  const nowMs = Date.now();
+  const windowMs = 10 * 60 * 1000;
+  const windowStartMs = nowMs - windowMs;
+
+  const logsInWindow = recentLogs.filter(l => {
+    const t = Date.parse(l.received_at);
+    return !Number.isNaN(t) && t >= windowStartMs && t <= nowMs;
+  });
+
+  const pushRatePerMin = logsInWindow.length / 10;
+
+  const BUCKETS = 12;
+  const bucketMs = windowMs / BUCKETS;
+  const buckets = Array.from({ length: BUCKETS }, () => 0);
+  for (const l of logsInWindow) {
+    const t = Date.parse(l.received_at);
+    const idx = Math.floor((t - windowStartMs) / bucketMs);
+    if (idx >= 0 && idx < BUCKETS) buckets[idx] += 1;
+  }
+  const maxBucket = Math.max(...buckets, 1);
+
+  const levelOrder = ['error', 'fatal', 'warn', 'info', 'debug', 'trace'] as const;
+  const levelCounts = Object.fromEntries(levelOrder.map(lv => [lv, 0])) as Record<(typeof levelOrder)[number], number>;
+  for (const l of logsInWindow) {
+    const lvl = String(l.entry.level || '').toLowerCase() as (typeof levelOrder)[number];
+    if (lvl in levelCounts) levelCounts[lvl] += 1;
+  }
 
   const buildPushPayload = (message: string): AkavelogStream[] => [
     {
-      stream: { job: 'demo-ui', app: 'akavelog' },
-      values: [[String(Date.now() * 1_000_000), message || `Test log at ${new Date().toISOString()}`]],
+      stream: { app: 'akavelog', job: serviceName.trim() || 'akavelog', level },
+      values: [[String(Date.now() * 1_000_000), message || `log at ${new Date().toISOString()}`]],
     },
   ];
 
-  const handleSendTest = async () => {
+  const handleSend = async () => {
     setSending(true);
     setError(null);
-    setPushMs(null);
-    const payload = buildPushPayload(logMessage);
-    const t0 = performance.now();
+    setSuccess(false);
     try {
-      await sendAkavelogPush(payload);
-      setPushMs(Math.round(performance.now() - t0));
-      await loadLogs();
+      await sendAkavelogPush(buildPushPayload(logMessage));
+      await loadStatus();
+      setSuccess(true);
+      setTimeout(() => setSuccess(false), 2000);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Send failed');
     } finally {
@@ -76,180 +114,206 @@ export default function DemoPage() {
     }
   };
 
-  const getCurlCommand = () => {
-    const url = typeof window !== 'undefined' ? getPushUrl() : 'http://localhost:3000/api/akavelog/api/v1/push';
-    const payload = buildPushPayload(logMessage);
-    const body = JSON.stringify({ streams: payload });
-    const escaped = body.replace(/'/g, "'\\''");
-    return `curl -X POST '${url}' \\
-  -H 'Content-Type: application/json' \\
-  -d '${escaped}'`;
-  };
-
-  const handleCopyCurl = async () => {
-    try {
-      await navigator.clipboard.writeText(getCurlCommand());
-      setCopyCurlDone(true);
-      setTimeout(() => setCopyCurlDone(false), 2000);
-    } catch {
-      setError('Copy failed');
-    }
-  };
-
   return (
-    <div className="min-h-screen flex flex-col md:flex-row gap-4 p-4 bg-[var(--bg)]">
-      <div className="flex-1 flex flex-col gap-4 min-w-0">
-        <header className="border-b border-[var(--border)] pb-2">
-          <div className="flex items-center gap-4 flex-wrap">
-            <h1 className="text-xl font-semibold text-[var(--accent)]">Akavelog Demo</h1>
-            {/* ── Navigation ── */}
-            <Link href="/logs" className="text-sm text-[var(--muted)] hover:text-[var(--accent)] transition-colors">
-              Log Explorer →
-            </Link>
-            <Link href="/uploads" className="text-sm text-[var(--muted)] hover:text-[var(--accent)] transition-colors">
-              View O3 uploads →
-            </Link>
-            <Link href="/stored" className="text-sm text-[var(--muted)] hover:text-[var(--accent)] transition-colors">
-              Stored data (raw) →
-            </Link>
-          </div>
-          <p className="text-sm text-[var(--muted)]">
-            Push logs via POST /akavelog/api/v1/push. Watch uploads to Akave O3.
-          </p>
-        </header>
+    <div className="min-h-screen flex flex-col bg-[var(--bg)] text-[var(--text)]">
 
-        {error && (
-          <div className="rounded-lg bg-red-500/10 border border-red-500/30 text-red-400 px-3 py-2 text-sm">
-            {error}
-          </div>
-        )}
+      {/* ── Header ── */}
+      <header className="border-b border-[var(--border)] px-6 py-4 flex items-center gap-6">
+        <h1 className="text-base font-semibold text-[var(--accent)] tracking-wide uppercase">
+          Akavelog
+        </h1>
+        <nav className="flex items-center gap-4 ml-2">
+          <Link href="/logs"    className="text-xs text-[var(--muted)] hover:text-[var(--accent)] transition-colors">Log Explorer →</Link>
+          <Link href="/uploads" className="text-xs text-[var(--muted)] hover:text-[var(--accent)] transition-colors">O3 Uploads →</Link>
+          <Link href="/stored"  className="text-xs text-[var(--muted)] hover:text-[var(--accent)] transition-colors">Stored Data →</Link>
+        </nav>
+        <span className="ml-auto text-[10px] text-[var(--muted)] font-mono">
+          POST /akavelog/api/v1/push
+        </span>
+      </header>
 
-        <section className="rounded-xl bg-[var(--card)] border border-[var(--border)] p-4">
-          <h2 className="text-sm font-medium text-[var(--muted)] mb-3">Push logs</h2>
-          <p className="text-sm text-[var(--muted)] mb-3">
-            POST /akavelog/api/v1/push with JSON: streams[].stream (labels), streams[].values ([ts_ns, line]). Chunks flush to O3 after 5s idle or 50 entries.
-          </p>
-          <div className="mb-3">
-            <input
-              type="text"
-              value={logMessage}
-              onChange={(e) => setLogMessage(e.target.value)}
-              placeholder="the log"
-              className="w-full rounded-lg bg-[var(--bg)] border border-[var(--border)] px-3 py-2 text-sm font-mono placeholder:text-[var(--muted)]"
-            />
-          </div>
-          <div className="flex flex-wrap gap-2 items-center">
-            <button
-              type="button"
-              onClick={handleSendTest}
-              disabled={sending}
-              className="rounded-lg bg-[var(--accent)] text-[var(--bg)] px-4 py-2 text-sm font-medium disabled:opacity-50"
-            >
-              {sending ? 'Sending…' : 'Send test log'}
-            </button>
-            {pushMs != null && (
-              <span className="text-sm text-[var(--muted)]">Push took {pushMs} ms</span>
+      <main className="flex-1 px-6 py-6 grid grid-cols-1 lg:grid-cols-3 gap-6 items-start max-w-6xl mx-auto w-full">
+
+        {/* ── Left column: Push form + Rate chart ── */}
+        <div className="lg:col-span-2 flex flex-col gap-5">
+
+          {/* Push form */}
+          <section className="rounded-xl bg-[var(--card)] border border-[var(--border)] p-5">
+            <h2 className="text-sm font-semibold text-[var(--text)] mb-4">Push log</h2>
+
+            {error && (
+              <div className="rounded-lg bg-red-500/10 border border-red-500/30 text-red-400 px-3 py-2 text-xs mb-4">
+                {error}
+              </div>
             )}
-            <button
-              type="button"
-              onClick={handleCopyCurl}
-              className="rounded-lg bg-[var(--border)] hover:bg-[var(--muted)] px-4 py-2 text-sm disabled:opacity-50"
-            >
-              {copyCurlDone ? 'Copied!' : 'Copy curl'}
-            </button>
-          </div>
-          <p className="text-xs text-[var(--muted)] mt-2">
-            Use &quot;Copy curl&quot; and run in terminal to test the same request. Logs flush to O3 within ~5s of last write.
-          </p>
-        </section>
 
-        <section className="rounded-xl bg-[var(--card)] border border-[var(--border)] p-4 flex-1 min-h-[200px] flex flex-col">
-          <div className="flex items-center justify-between mb-3">
-            <h2 className="text-sm font-medium text-[var(--muted)]">Incoming logs (last 200)</h2>
-            <Link
-              href="/logs"
-              className="text-xs text-[var(--accent)] hover:underline transition-colors"
-            >
-              Open Log Explorer →
-            </Link>
-          </div>
-          <div className="flex-1 overflow-auto rounded-lg bg-[var(--bg)] border border-[var(--border)] p-2 font-mono text-xs">
-            {logs.length === 0 ? (
-              <p className="text-[var(--muted)]">Logs appear here after you push. Polling every 2s.</p>
-            ) : (
-              <ul className="space-y-2">
-                {[...logs].reverse().map((l, i) => (
-                  <li key={i} className="border-b border-[var(--border)]/50 pb-2">
-                    {l.entry.raw_request ? (
-                      <pre className="text-xs whitespace-pre-wrap break-all overflow-x-auto bg-[var(--bg)]/80 p-2 rounded border border-[var(--border)]/50">
-                        {l.entry.raw_request.method} {l.entry.raw_request.path}
-                        {l.entry.raw_request.query ? `?${l.entry.raw_request.query}` : ''}
-                        {l.entry.raw_request.headers && Object.keys(l.entry.raw_request.headers).length > 0 && (
-                          <>
-                            {'\n'}
-                            {Object.entries(l.entry.raw_request.headers).map(([k, v]) => (
-                              <span key={k}>{'\n'}{k}: {v}</span>
-                            ))}
-                          </>
-                        )}
-                        {l.entry.raw_request.body != null && l.entry.raw_request.body !== '' && (
-                          <>{'\n\n'}{l.entry.raw_request.body}</>
-                        )}
-                      </pre>
-                    ) : (
-                      <>
-                        <span className="text-[var(--muted)]">{new Date(l.received_at).toLocaleTimeString()}</span>
-                        {' '}
-                        <span className="text-[var(--warn)]">{l.entry.service}</span>
-                        {' '}
-                        <span className="text-[var(--accent)]">{l.entry.level}</span>
-                        {' '}
-                        {l.entry.message}
-                        {l.entry.tags && Object.keys(l.entry.tags).length > 0 && (
-                          <span className="text-[var(--muted)]"> {JSON.stringify(l.entry.tags)}</span>
-                        )}
-                      </>
-                    )}
-                  </li>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-3">
+              <div className="sm:col-span-2">
+                <label className="block text-xs text-[var(--muted)] mb-1">Service (job label)</label>
+                <input
+                  type="text"
+                  value={serviceName}
+                  onChange={e => setServiceName(e.target.value)}
+                  placeholder="e.g. payments-api"
+                  className="w-full rounded-lg bg-[var(--bg)] border border-[var(--border)] px-3 py-2 text-sm font-mono placeholder:text-[var(--muted)] focus:outline-none focus:border-[var(--accent)] transition-colors"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-[var(--muted)] mb-1">Level</label>
+                <select
+                  value={level}
+                  onChange={e => setLevel(e.target.value as (typeof LEVELS)[number])}
+                  className="w-full rounded-lg bg-[var(--bg)] border border-[var(--border)] px-3 py-2 text-sm font-mono text-[var(--text)] focus:outline-none focus:border-[var(--accent)] transition-colors"
+                >
+                  {LEVELS.map(l => <option key={l} value={l}>{l}</option>)}
+                </select>
+              </div>
+            </div>
+
+            <div className="mb-4">
+              <label className="block text-xs text-[var(--muted)] mb-1">Message</label>
+              <input
+                type="text"
+                value={logMessage}
+                onChange={e => setLogMessage(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') handleSend(); }}
+                placeholder="your log message…"
+                className="w-full rounded-lg bg-[var(--bg)] border border-[var(--border)] px-3 py-2 text-sm font-mono placeholder:text-[var(--muted)] focus:outline-none focus:border-[var(--accent)] transition-colors"
+              />
+            </div>
+
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                onClick={handleSend}
+                disabled={sending}
+                className="rounded-lg bg-[var(--accent)] text-[var(--bg)] px-5 py-2 text-sm font-semibold disabled:opacity-50 hover:opacity-90 transition-opacity"
+              >
+                {sending ? 'Sending…' : 'Push log'}
+              </button>
+              {success && <span className="text-xs text-[var(--success)]">✓ Sent</span>}
+            </div>
+          </section>
+
+          {/* Rate chart */}
+          <section className="rounded-xl bg-[var(--card)] border border-[var(--border)] p-5">
+            <div className="flex items-baseline justify-between mb-1">
+              <h2 className="text-sm font-semibold text-[var(--text)]">Push rate</h2>
+              <span className="text-xs text-[var(--muted)]">last 10 min</span>
+            </div>
+
+            <div className="flex items-baseline gap-2 mb-1">
+              <span className="text-2xl font-bold text-[var(--accent)]">{pushRatePerMin.toFixed(1)}</span>
+              <span className="text-xs text-[var(--muted)]">logs / min</span>
+              <span className="text-xs text-[var(--muted)] ml-2">({logsInWindow.length} total)</span>
+            </div>
+
+            {/* Bar chart */}
+            <div className="mt-4 flex items-end gap-[3px] h-24">
+              {buckets.map((c, i) => {
+                const heightPct = c === 0 ? 4 : Math.max(6, Math.round((c / maxBucket) * 100));
+                const isLast = i === buckets.length - 1;
+                return (
+                  <div
+                    key={i}
+                    className="flex-1 rounded-sm transition-all"
+                    style={{
+                      height: `${heightPct}%`,
+                      background: isLast
+                        ? 'var(--accent)'
+                        : c === 0 ? 'var(--border)' : `color-mix(in srgb, var(--accent) ${30 + Math.round((c / maxBucket) * 70)}%, var(--border))`,
+                      opacity: isLast ? 1 : 0.6 + (i / buckets.length) * 0.4,
+                    }}
+                    title={`${c} logs`}
+                  />
+                );
+              })}
+            </div>
+            <div className="flex justify-between mt-1 text-[9px] text-[var(--muted)]">
+              <span>10m ago</span>
+              <span>now</span>
+            </div>
+
+            {/* Level breakdown */}
+            <div className="mt-4 pt-4 border-t border-[var(--border)]">
+              <p className="text-[10px] uppercase tracking-wider text-[var(--muted)] mb-2">By level</p>
+              <div className="grid grid-cols-3 gap-y-1.5 gap-x-4">
+                {levelOrder.map(lv => (
+                  <div key={lv} className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-mono" style={{ color: LEVEL_COLORS[lv] }}>
+                      {lv}
+                    </span>
+                    <span className="text-xs font-mono text-[var(--text)]">{levelCounts[lv]}</span>
+                  </div>
                 ))}
-              </ul>
-            )}
-          </div>
-        </section>
-      </div>
+              </div>
+            </div>
+          </section>
+        </div>
 
-      <aside className="w-full md:w-80 shrink-0 rounded-xl bg-[var(--card)] border border-[var(--border)] p-4 h-fit">
-        <h2 className="text-sm font-medium text-[var(--muted)] mb-3">Upload status (O3)</h2>
-        {!uploadStatus ? (
-          <p className="text-sm text-[var(--muted)]">Loading…</p>
-        ) : (
-          <div className="space-y-3 text-sm">
-            <p>
-              Batcher:{' '}
-              <span className={uploadStatus.batcher_enabled ? 'text-[var(--success)]' : 'text-[var(--muted)]'}>
-                {uploadStatus.batcher_enabled ? 'On' : 'Off'}
-              </span>
-            </p>
-            {uploadStatus.batcher_enabled && (
-              <>
-                <p className="text-[var(--muted)]">
-                  Last upload: {uploadStatus.last_upload_count} logs
+        {/* ── Right column: O3 Upload status ── */}
+        <aside className="rounded-xl bg-[var(--card)] border border-[var(--border)] p-5 h-fit lg:sticky lg:top-6">
+          <h2 className="text-sm font-semibold text-[var(--text)] mb-4">O3 Upload Status</h2>
+
+          {!uploadStatus ? (
+            <div className="space-y-2">
+              {[...Array(4)].map((_, i) => (
+                <div key={i} className="h-4 rounded bg-[var(--border)]/40 animate-pulse" style={{ width: `${60 + i * 10}%` }} />
+              ))}
+            </div>
+          ) : (
+            <div className="space-y-3 text-sm">
+              {/* Batcher status */}
+              <div className="flex items-center justify-between">
+                <span className="text-xs text-[var(--muted)]">Batcher</span>
+                <span className={`text-xs font-semibold px-2 py-0.5 rounded-full border ${
+                  uploadStatus.batcher_enabled
+                    ? 'text-[var(--success)] bg-green-500/10 border-green-500/30'
+                    : 'text-[var(--muted)] bg-zinc-500/10 border-zinc-500/30'
+                }`}>
+                  {uploadStatus.batcher_enabled ? '● On' : '○ Off'}
+                </span>
+              </div>
+
+              {uploadStatus.batcher_enabled ? (
+                <>
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs text-[var(--muted)]">Last batch</span>
+                    <span className="text-xs font-mono text-[var(--text)]">{uploadStatus.last_upload_count} logs</span>
+                  </div>
+
+                  {uploadStatus.last_upload_at && (
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs text-[var(--muted)]">At</span>
+                      <span className="text-xs font-mono text-[var(--muted)]">
+                        {new Date(uploadStatus.last_upload_at).toLocaleTimeString()}
+                      </span>
+                    </div>
+                  )}
+
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs text-[var(--muted)]">Pending chunks</span>
+                    <span className="text-xs font-mono text-[var(--accent)]">{uploadStatus.pending_count}</span>
+                  </div>
+
+                  {uploadStatus.last_upload_key && (
+                    <div className="mt-2 pt-3 border-t border-[var(--border)]">
+                      <p className="text-[10px] uppercase tracking-wider text-[var(--muted)] mb-1">Last key</p>
+                      <p className="font-mono text-[var(--accent)] break-all bg-[var(--bg)] rounded border border-[var(--border)] px-2 py-1.5 text-[10px]">
+                        {uploadStatus.last_upload_key}
+                      </p>
+                    </div>
+                  )}
+                </>
+              ) : (
+                <p className="text-xs text-[var(--muted)] pt-1">
+                  O3 not configured — logs won't be persisted as chunks.
                 </p>
-                {uploadStatus.last_upload_at && (
-                  <p className="text-xs text-[var(--muted)]">
-                    {new Date(uploadStatus.last_upload_at).toLocaleString()}
-                  </p>
-                )}
-                {uploadStatus.last_upload_key && (
-                  <p className="text-xs font-mono text-[var(--accent)] break-all">
-                    {uploadStatus.last_upload_key}
-                  </p>
-                )}
-              </>
-            )}
-          </div>
-        )}
-      </aside>
+              )}
+            </div>
+          )}
+        </aside>
+      </main>
     </div>
   );
 }

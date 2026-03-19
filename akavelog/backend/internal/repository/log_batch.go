@@ -89,7 +89,7 @@ func (r *LogBatchRepository) ListByTimeRange(
 		WHERE  tenant   = $1
 		  AND  ts_start <= $3
 		  AND  ts_end   >= $2
-		ORDER  BY ts_start ASC
+		ORDER  BY ts_start DESC
 	`
 	rows, err := r.pool.Query(ctx, q, p.Tenant, p.TsStart, p.TsEnd)
 	if err != nil {
@@ -148,7 +148,7 @@ func (r *LogBatchRepository) ListByFilter(
 		SELECT id, project_id, tenant, stream_id, service,
 		       ts_start, ts_end, levels, tags, o3_object_key, entry_count, created_at
 		FROM   log_batches` + where + `
-		ORDER  BY ts_start ASC`
+		ORDER  BY ts_start DESC`
 
 	rows, err := r.pool.Query(ctx, q, args...)
 	if err != nil {
