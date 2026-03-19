@@ -20,6 +20,7 @@ import (
 	"github.com/akave-ai/akavelog/internal/handler"
 	"github.com/akave-ai/akavelog/internal/index"
 	"github.com/akave-ai/akavelog/internal/ingester"
+	akavemiddleware "github.com/akave-ai/akavelog/internal/middleware"
 	"github.com/akave-ai/akavelog/internal/model"
 	"github.com/akave-ai/akavelog/internal/query"
 	"github.com/akave-ai/akavelog/internal/repository"
@@ -32,17 +33,15 @@ import (
 type Server struct {
 	Echo         *echo.Echo
 	Config       *config.Config
-	ingester     *ingester.Ingester // optional; stopped on Shutdown
-	indexWriter  *index.O3Writer    // optional; Progress index, stopped on Shutdown
-	o3Client     *storage.O3Client  // optional; for listing uploads
+	ingester     *ingester.Ingester
+	indexWriter  *index.O3Writer
+	o3Client     *storage.O3Client
 	recentLogs   *RecentLogsStore
 	uploadStatus *UploadStatusStore
-	alertWorker *worker.AlertWorker // optional
-
+	alertWorker  *worker.AlertWorker
 }
 
 // New builds the Echo server and registers routes.
-// Caller must provide a non-nil pool (e.g. from database.Database.Pool).
 func New(cfg *config.Config, pool *pgxpool.Pool) *Server {
 	e := echo.New()
 	e.HideBanner = true
@@ -79,7 +78,6 @@ func New(cfg *config.Config, pool *pgxpool.Pool) *Server {
 					streamConfig.MaxChunkEntries = cfg.Ingester.ChunkMaxEntries
 				}
 			}
-			// Demo-friendly defaults when O3 enabled: 5s idle, 50 entries.
 			if streamConfig.ChunkIdlePeriod == ingester.DefaultStreamConfig().ChunkIdlePeriod {
 				streamConfig.ChunkIdlePeriod = 5 * time.Second
 			}
@@ -89,7 +87,6 @@ func New(cfg *config.Config, pool *pgxpool.Pool) *Server {
 
 			ing = ingester.NewIngester(chunkStore, streamConfig, idxWriter)
 
-			// ── Phase 4: attach PostgreSQL metadata index ─────────────────────
 			if pool != nil {
 				logBatchRepo := repository.NewLogBatchRepository(pool)
 				ing.WithDBIndexer(logBatchRepo)
@@ -102,14 +99,10 @@ func New(cfg *config.Config, pool *pgxpool.Pool) *Server {
 			uploadStatus.mu.Lock()
 			uploadStatus.BatcherOn = true
 			uploadStatus.mu.Unlock()
-
-			log.Printf("[server] ingester + Progress index enabled: chunks to O3 (idle=%v, maxEntries=%d)",
-				streamConfig.ChunkIdlePeriod, streamConfig.MaxChunkEntries)
 		}
 	}
 
 	if ing == nil {
-		// No O3: noop chunk store, no index. Logs are visible in /logs/recent only.
 		ing = ingester.NewIngester(&noopChunkStore{}, ingester.DefaultStreamConfig(), nil)
 		ing.Start(context.Background())
 	}
@@ -122,12 +115,39 @@ func New(cfg *config.Config, pool *pgxpool.Pool) *Server {
 		}
 	}
 
-	// ── Routes ────────────────────────────────────────────────────────────────
+	// ── Phase 8: Project + API Key management ─────────────────────────────────
+	var projectRepo *repository.ProjectRepository
+	if pool != nil {
+		projectRepo = repository.NewProjectRepository(pool)
+		projectHandler := handler.NewProjectHandler(projectRepo)
 
-	// Akavelog push API
-	e.POST("/akavelog/api/v1/push", dist.PushHandler(onLog))
+		// Project CRUD — no auth required (bootstrap path)
+		e.POST("/projects", projectHandler.Create)
+		e.GET("/projects", projectHandler.List)
+		e.GET("/projects/:id", projectHandler.Get)
+		e.DELETE("/projects/:id", projectHandler.Delete)
 
-	// Demo UI helpers
+		// API key management — no auth (operators manage keys)
+		e.POST("/projects/:id/api-keys", projectHandler.CreateAPIKey)
+		e.GET("/projects/:id/api-keys", projectHandler.ListAPIKeys)
+		e.DELETE("/projects/:id/api-keys/:key", projectHandler.RevokeAPIKey)
+
+		log.Printf("[server] project + API key endpoints enabled")
+	}
+
+	// ── Authenticated route group (requires X-API-Key) ─────────────────────────
+	// When projectRepo is nil (no DB), auth middleware is skipped.
+	var authGroup *echo.Group
+	if projectRepo != nil {
+		authGroup = e.Group("", akavemiddleware.RequireAPIKey(projectRepo))
+	} else {
+		authGroup = e.Group("") // no auth in degraded mode
+	}
+
+	// Push API (authenticated)
+	authGroup.POST("/akavelog/api/v1/push", dist.PushHandler(onLog))
+
+	// Demo/ops helpers (unauthenticated — read-only observability)
 	e.GET("/logs/recent", func(c echo.Context) error {
 		return response.OK(c, map[string]any{"logs": recentLogs.GetRecent()}, "")
 	})
@@ -142,7 +162,6 @@ func New(cfg *config.Config, pool *pgxpool.Pool) *Server {
 		}, "")
 	})
 
-	// O3 object listing
 	e.GET("/uploads", func(c echo.Context) error {
 		if o3Client == nil {
 			return response.OK(c, map[string]any{"objects": []interface{}{}}, "O3 not configured")
@@ -158,7 +177,6 @@ func New(cfg *config.Config, pool *pgxpool.Pool) *Server {
 		return response.OK(c, map[string]any{"objects": list}, "")
 	})
 
-	// O3 Progress index lookup
 	e.GET("/index/chunks", func(c echo.Context) error {
 		if o3Client == nil {
 			return response.OK(c, map[string]any{"chunks": []interface{}{}}, "O3 not configured")
@@ -187,10 +205,6 @@ func New(cfg *config.Config, pool *pgxpool.Pool) *Server {
 		return response.OK(c, map[string]any{"chunks": refs}, "")
 	})
 
-	// ── Phase 4: PostgreSQL metadata index endpoint ───────────────────────────
-	// GET /index/batches?tenant=default&from=2006-01-02T15:04:05Z&to=...
-	// Returns log_batches rows (O3 object keys + metadata) for the given time range.
-	// This is the SQL counterpart to GET /index/chunks (O3-based).
 	e.GET("/index/batches", func(c echo.Context) error {
 		if pool == nil {
 			return response.OK(c, map[string]any{"batches": []interface{}{}}, "DB not configured")
@@ -228,7 +242,6 @@ func New(cfg *config.Config, pool *pgxpool.Pool) *Server {
 		return response.OK(c, map[string]any{"batches": batches}, "")
 	})
 
-	// Raw object content (gzip-transparent)
 	e.GET("/uploads/content", func(c echo.Context) error {
 		if o3Client == nil {
 			return response.BadRequest(c, "O3 not configured", "O3 not configured")
@@ -239,8 +252,6 @@ func New(cfg *config.Config, pool *pgxpool.Pool) *Server {
 		}
 		logs, err := o3Client.GetObjectLogs(c.Request().Context(), key)
 		if err != nil {
-			// Some historical/corrupted objects in O3 can fail to download or decode (e.g. unexpected EOF).
-			// Keep the UI functional by returning an empty payload rather than a 500.
 			log.Printf("[uploads/content] get upload content failed key=%s err=%v", key, err)
 			return response.OK(c, map[string]any{"logs": []model.LogEntry{}, "key": key}, "")
 		}
@@ -257,7 +268,6 @@ func New(cfg *config.Config, pool *pgxpool.Pool) *Server {
 		}
 		raw, err := o3Client.GetObject(c.Request().Context(), key)
 		if err != nil {
-			// UX: don't fail the entire UI when a single O3 object is corrupted/unreadable.
 			log.Printf("[uploads/raw] get raw object failed key=%s err=%v", key, err)
 			return response.OK(c, map[string]any{"key": key, "content": "", "encoding": "error"}, "")
 		}
@@ -275,38 +285,34 @@ func New(cfg *config.Config, pool *pgxpool.Pool) *Server {
 		return response.OK(c, map[string]any{"key": key, "content": content, "encoding": encoding}, "")
 	})
 
-	// ── Phase 5: Query Engine ─────────────────────────────────────────────────
+	// ── Phase 5: Query Engine (authenticated) ─────────────────────────────────
 	if o3Client != nil && pool != nil {
 		queryEngine := query.New(repository.NewLogBatchRepository(pool), o3Client)
 		queryHandler := handler.NewQueryHandler(queryEngine)
 
-		// POST /query — full result set as JSON
-		e.POST("/query", queryHandler.Handle)
-
-		// GET /query/stream — Server-Sent Events stream
-		e.GET("/query/stream", queryHandler.HandleSSE)
+		authGroup.POST("/query", queryHandler.Handle)
+		authGroup.GET("/query/stream", queryHandler.HandleSSE)
 
 		log.Printf("[server] query engine enabled: POST /query, GET /query/stream")
 	}
 
-	// ── Phase 7: Alert rules CRUD + background worker ─────────────────────────
+	// ── Phase 7: Alert rules (authenticated) ──────────────────────────────────
 	if pool != nil {
 		alertRepo := repository.NewAlertRepository(pool)
-    	alertHandler := handler.NewAlertHandler(alertRepo)
+		alertHandler := handler.NewAlertHandler(alertRepo)
 
-    	e.POST("/alerts", alertHandler.Create)
-    	e.GET("/alerts", alertHandler.List)
-    	e.DELETE("/alerts/:id", alertHandler.Delete)
-    	e.GET("/alerts/:id/events", alertHandler.ListEvents)
+		authGroup.POST("/alerts", alertHandler.Create)
+		authGroup.GET("/alerts", alertHandler.List)
+		authGroup.DELETE("/alerts/:id", alertHandler.Delete)
+		authGroup.GET("/alerts/:id/events", alertHandler.ListEvents)
 
-    	log.Printf("[server] alert endpoints enabled: POST/	GET /alerts, DELETE /alerts/:id")
+		log.Printf("[server] alert endpoints enabled")
 
-    	// Start background worker if query engine is also 	available
-    	if o3Client != nil {
-        	alertWorker := worker.New(alertRepo, worker.	NewQueryEngineCounter(repository.	NewLogBatchRepository(pool)), 60*time.Second)
-        	alertWorker.Start(context.Background())
-        	log.Printf("[alert-worker] background evaluation 	started (60s interval)")
-    	}
+		if o3Client != nil {
+			alertWorker := worker.New(alertRepo, worker.NewQueryEngineCounter(repository.NewLogBatchRepository(pool)), 60*time.Second)
+			alertWorker.Start(context.Background())
+			log.Printf("[alert-worker] background evaluation started (60s interval)")
+		}
 	}
 
 	return &Server{
@@ -320,23 +326,20 @@ func New(cfg *config.Config, pool *pgxpool.Pool) *Server {
 	}
 }
 
-// Start starts the HTTP server. Blocks until the context is cancelled or the server fails.
+// Start starts the HTTP server.
 func (s *Server) Start(ctx context.Context) error {
 	go func() {
 		<-ctx.Done()
 		_ = s.Shutdown(context.Background())
 	}()
-	addr := ":" + s.Config.Server.Port
-	return s.Echo.Start(addr)
+	return s.Echo.Start(":" + s.Config.Server.Port)
 }
 
-// Shutdown gracefully shuts down the server, ingester, and Progress index writer.
+// Shutdown gracefully stops everything.
 func (s *Server) Shutdown(ctx context.Context) error {
-
 	if s.alertWorker != nil {
-        s.alertWorker.Stop()
-    }
-	
+		s.alertWorker.Stop()
+	}
 	if s.ingester != nil {
 		s.ingester.Stop()
 	}
@@ -346,12 +349,10 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return s.Echo.Shutdown(ctx)
 }
 
-// noopChunkStore drops chunks (used when O3 is not configured).
 type noopChunkStore struct{}
 
 func (n *noopChunkStore) Put(_ context.Context, _ []chunk.Chunk) error { return nil }
 
-// labelsToLogEntry converts push (labels, tsNs, line) to model.LogEntry for the recent-logs UI.
 func labelsToLogEntry(labels map[string]string, tsNs int64, line string) *model.LogEntry {
 	service := "akavelog"
 	if labels != nil {
