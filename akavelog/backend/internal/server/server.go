@@ -25,6 +25,7 @@ import (
 	"github.com/akave-ai/akavelog/internal/repository"
 	"github.com/akave-ai/akavelog/internal/response"
 	"github.com/akave-ai/akavelog/internal/storage"
+	"github.com/akave-ai/akavelog/internal/worker"
 )
 
 // Server holds the Echo app and dependencies.
@@ -36,6 +37,8 @@ type Server struct {
 	o3Client     *storage.O3Client  // optional; for listing uploads
 	recentLogs   *RecentLogsStore
 	uploadStatus *UploadStatusStore
+	alertWorker *worker.AlertWorker // optional
+
 }
 
 // New builds the Echo server and registers routes.
@@ -286,6 +289,26 @@ func New(cfg *config.Config, pool *pgxpool.Pool) *Server {
 		log.Printf("[server] query engine enabled: POST /query, GET /query/stream")
 	}
 
+	// ── Phase 7: Alert rules CRUD + background worker ─────────────────────────
+	if pool != nil {
+		alertRepo := repository.NewAlertRepository(pool)
+    	alertHandler := handler.NewAlertHandler(alertRepo)
+
+    	e.POST("/alerts", alertHandler.Create)
+    	e.GET("/alerts", alertHandler.List)
+    	e.DELETE("/alerts/:id", alertHandler.Delete)
+    	e.GET("/alerts/:id/events", alertHandler.ListEvents)
+
+    	log.Printf("[server] alert endpoints enabled: POST/	GET /alerts, DELETE /alerts/:id")
+
+    	// Start background worker if query engine is also 	available
+    	if o3Client != nil {
+        	alertWorker := worker.New(alertRepo, worker.	NewQueryEngineCounter(repository.	NewLogBatchRepository(pool)), 60*time.Second)
+        	alertWorker.Start(context.Background())
+        	log.Printf("[alert-worker] background evaluation 	started (60s interval)")
+    	}
+	}
+
 	return &Server{
 		Echo:         e,
 		Config:       cfg,
@@ -309,6 +332,11 @@ func (s *Server) Start(ctx context.Context) error {
 
 // Shutdown gracefully shuts down the server, ingester, and Progress index writer.
 func (s *Server) Shutdown(ctx context.Context) error {
+
+	if s.alertWorker != nil {
+        s.alertWorker.Stop()
+    }
+	
 	if s.ingester != nil {
 		s.ingester.Stop()
 	}
