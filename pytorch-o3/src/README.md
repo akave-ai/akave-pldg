@@ -380,5 +380,35 @@ This project was developed by **Team ASBG** over a 3-week sprint:
 - **Boma_Naps** - Milestone contributions & optimization
 - **gerceboss** - Milestone contributions & deployment
 
-We welcome community contributions! Please feel free to open issues, submit pull requests, or reach out with feedback.
+Special thanks to reviewers:
+- **Amit** - Architecture & design review
+- **Abhay** - Technical validation & feedback
+
+---
+
+## Resources & Links
+
+- **GitHub Repository**: https://github.com/gitsofaryan/akave-pytorch-o3
+- **Task/Issue Tracker**: https://github.com/akave-ai/akave-pldg/issues/8
+- **Demo Video**: https://www.youtube.com/watch?v=5zSXCAVBs64
+
+---
+
+## Known Issues & Optimization
+
+- **Rate Limiting**: Currently experiencing rate limits during heavy streaming when uploading large
+  checkpoints. The retrying mechanism is in place (2–8 minute exponential backoff), but further
+  optimization is being explored.
+
+---
+
+## Feedback & Support
+
+We welcome community contributions and feedback! Please:
+
+- 📝 Open an issue if you find bugs or have feature requests
+- 🔄 Submit pull requests with improvements or fixes
+- 💬 Reach out with suggestions for optimizing rate limiting or streaming efficiency
+
+Your feedback helps us improve the integration and make decentralized ML training more accessible! 🚀
 
