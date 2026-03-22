@@ -1,0 +1,17 @@
+[logger]
+level = "info"
+
+[client]
+showErrorDetails = true
+
+[server]
+enableXsrfProtection = false
+port = 8501
+
+[theme]
+base = "dark"
+primaryColor = "#e8451e"
+backgroundColor = "#110a06"
+secondaryBackgroundColor = "#1c120c"
+textColor = "#f0e4d8"
+font = "sans serif"

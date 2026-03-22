@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: pytorch-o3
+Version: 0.1.0
+Summary: PyTorch-compatible training pipeline using Akave O3 Native SDK
+Author: Aryan Jain
+Requires-Dist: torch>=2.0.0
+Requires-Dist: akavesdk @ git+https://github.com/d4v1d03/akavesdk-py.git
+Requires-Dist: tenacity>=8.2.0
+Provides-Extra: examples
+Requires-Dist: python-dotenv>=1.0.0; extra == "examples"
+Requires-Dist: torchvision; extra == "examples"

@@ -1,0 +1,25 @@
+{
+  "name": "CIFAR-10 (Sample)",
+  "description": "Synthetic 2000 train + 500 test RGB images (32x32)",
+  "classes": 10,
+  "class_names": [
+    "airplane",
+    "automobile",
+    "bird",
+    "cat",
+    "deer",
+    "dog",
+    "frog",
+    "horse",
+    "ship",
+    "truck"
+  ],
+  "train_samples": 2000,
+  "test_samples": 500,
+  "image_shape": [
+    32,
+    32
+  ],
+  "channels": 3,
+  "source": "Synthetic (demo purposes)"
+}
