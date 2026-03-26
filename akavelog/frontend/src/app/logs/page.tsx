@@ -1,13 +1,15 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import Link from 'next/link';
 import {
+  getUploadRaw,
   streamLogs,
   type QueryRequest,
   type QueryResultEntry,
   type SSEDoneEvent,
 } from '@/lib/api';
+import LogsPageHeader from './components/LogsPageHeader';
+import RawJsonViewer from './components/RawJsonViewer';
 
 const LEVELS = ['error', 'warn', 'info', 'debug', 'fatal', 'trace'];
 
@@ -47,6 +49,22 @@ function fmtTimestamp(ts: string): string {
     const ms = String(d.getMilliseconds()).padStart(3, '0');
     return `${date} ${time}.${ms}`;
   } catch { return ts; }
+}
+
+function fmtRelative(ts: string): string {
+  try {
+    const diff = Date.now() - new Date(ts).getTime();
+    const s = Math.max(0, Math.floor(diff / 1000));
+    if (s < 60) return `${s}s ago`;
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m}m ago`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `${h}h ago`;
+    const d = Math.floor(h / 24);
+    return `${d}d ago`;
+  } catch {
+    return ts;
+  }
 }
 
 function toRFC3339(localValue: string): string {
@@ -91,6 +109,12 @@ export default function LogsPage() {
   const [summary, setSummary]        = useState<SSEDoneEvent | null>(null);
   const [streamError, setStreamError] = useState<string | null>(null);
   const [expandedIdx, setExpandedIdx] = useState<number | null>(null);
+  const [rawExpandedIdx, setRawExpandedIdx] = useState<number | null>(null);
+  const [rawByKey, setRawByKey] = useState<Record<string, string>>({});
+  const [rawLoadingKey, setRawLoadingKey] = useState<string | null>(null);
+  const [wrapRaw, setWrapRaw] = useState(true);
+  const [relativeTime, setRelativeTime] = useState(false);
+  const [density, setDensity] = useState<'compact' | 'comfortable'>('comfortable');
   /** Whether there are more pages to load (backend said truncated on last page). */
   const [hasMore, setHasMore] = useState(false);
 
@@ -224,6 +248,12 @@ export default function LogsPage() {
     setStreamError(null);
     setSearchState('idle');
     setExpandedIdx(null);
+    setRawExpandedIdx(null);
+    setRawByKey({});
+    setRawLoadingKey(null);
+    setWrapRaw(true);
+    setRelativeTime(false);
+    setDensity('comfortable');
     setHasMore(false);
     setFilters(DEFAULT_FILTERS);
   };
@@ -238,21 +268,70 @@ export default function LogsPage() {
     if (e.key === 'Enter') handleSearch();
   };
 
+  const formatRawJsonForEntry = (content: string, entry: QueryResultEntry): string => {
+    try {
+      const parsed = JSON.parse(content) as {
+        labels?: Record<string, string>;
+        entries?: Array<{ ts_ns?: number; line?: string }>;
+      };
+      if (Array.isArray(parsed?.entries)) {
+        const matched =
+          parsed.entries.find((e) => Number(e.ts_ns) === Number(entry.ts_ns)) ||
+          parsed.entries.find((e) => (e.line || '') === entry.line);
+        if (matched) {
+          return JSON.stringify(
+            {
+              labels: parsed.labels || {},
+              entry: matched,
+            },
+            null,
+            2
+          );
+        }
+      }
+      return JSON.stringify(parsed, null, 2);
+    } catch {
+      return content;
+    }
+  };
+
+  const toggleRawLog = async (idx: number, objectKey: string) => {
+    if (rawExpandedIdx === idx) {
+      setRawExpandedIdx(null);
+      return;
+    }
+    setRawExpandedIdx(idx);
+    if (rawByKey[objectKey]) return;
+    setRawLoadingKey(objectKey);
+    try {
+      const res = await getUploadRaw(objectKey);
+      setRawByKey(prev => ({ ...prev, [objectKey]: res.content }));
+    } catch (e) {
+      setRawByKey(prev => ({
+        ...prev,
+        [objectKey]: e instanceof Error ? e.message : 'Failed to load raw log',
+      }));
+    } finally {
+      setRawLoadingKey(null);
+    }
+  };
+
+  const copyText = async (text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      // ignore
+    }
+  };
+
   // ── Render ──────────────────────────────────────────────────────────────────
   return (
     <div className="h-screen flex flex-col bg-[var(--bg)] overflow-hidden">
 
-      {/* Navigation */}
-      <header className="shrink-0 border-b border-[var(--border)] px-4 py-2 flex items-center gap-4 flex-wrap">
-        <Link href="/" className="text-[var(--muted)] hover:text-[var(--accent)] text-sm transition-colors">← Home</Link>
-        <span className="text-[var(--accent)] font-semibold tracking-wide text-sm">LOG EXPLORER</span>
-        <div className="ml-auto flex items-center gap-3 text-xs text-[var(--muted)]">
-          <Link href="/uploads" className="hover:text-[var(--accent)] transition-colors">O3 Uploads</Link>
-        </div>
-      </header>
+      <LogsPageHeader />
 
       {/* Filter bar */}
-      <div className="shrink-0 border-b border-[var(--border)] bg-[var(--card)] px-4 py-3 space-y-3">
+      <div className="shrink-0 border-b border-[var(--border)] bg-[var(--card)] px-4 py-3 space-y-3 shadow-sm">
 
         {/* Row 1: time range */}
         <div className="flex flex-wrap gap-3 items-center">
@@ -363,6 +442,20 @@ export default function LogsPage() {
           <div className="flex gap-2 ml-auto">
             <button
               type="button"
+              onClick={() => setRelativeTime(v => !v)}
+              className="px-2 py-1.5 rounded text-xs border border-[var(--border)] text-[var(--muted)] hover:text-[var(--accent)] transition-colors"
+            >
+              {relativeTime ? 'Absolute time' : 'Relative time'}
+            </button>
+            <button
+              type="button"
+              onClick={() => setDensity(v => (v === 'compact' ? 'comfortable' : 'compact'))}
+              className="px-2 py-1.5 rounded text-xs border border-[var(--border)] text-[var(--muted)] hover:text-[var(--accent)] transition-colors"
+            >
+              {density === 'compact' ? 'Comfortable rows' : 'Compact rows'}
+            </button>
+            <button
+              type="button"
               onClick={handleClear}
               className="px-3 py-1.5 rounded text-xs border border-[var(--border)] text-[var(--muted)] hover:text-red-400 hover:border-red-400/50 transition-colors"
             >
@@ -390,7 +483,7 @@ export default function LogsPage() {
       </div>
 
       {/* Status bar */}
-      <div className="shrink-0 border-b border-[var(--border)] px-4 py-1.5 flex items-center gap-4 text-xs text-[var(--muted)]">
+      <div className="shrink-0 border-b border-[var(--border)] bg-[var(--card)]/40 px-4 py-2 flex items-center gap-4 text-xs text-[var(--muted)]">
         {searchState === 'streaming' && !hasMore && (
           <span className="flex items-center gap-1.5">
             <span className="inline-block w-1.5 h-1.5 rounded-full bg-[var(--accent)] animate-pulse" />
@@ -442,24 +535,27 @@ export default function LogsPage() {
             <tbody>
               {results.map((entry, idx) => {
                 const isExpanded = expandedIdx === idx;
+                const showRaw = rawExpandedIdx === idx;
                 return (
                   <>
                     <tr
                       key={`${entry.ts_ns}-${idx}`}
                       onClick={() => setExpandedIdx(isExpanded ? null : idx)}
                       className={`border-b border-[var(--border)]/40 cursor-pointer transition-colors ${
-                        isExpanded ? 'bg-[var(--card)]' : 'hover:bg-[var(--card)]/60'
+                        isExpanded ? 'bg-[var(--card)]' : 'hover:bg-[var(--card)]/70'
                       }`}
                     >
-                      <td className="px-3 py-1.5 text-[var(--muted)] whitespace-nowrap">{fmtTimestamp(entry.timestamp)}</td>
-                      <td className="px-3 py-1.5 text-[var(--warn)] truncate max-w-[7rem]" title={entry.service}>{entry.service}</td>
-                      <td className="px-3 py-1.5">
+                      <td className={`px-3 ${density === 'compact' ? 'py-1' : 'py-1.5'} text-[var(--muted)] whitespace-nowrap`}>
+                        {relativeTime ? fmtRelative(entry.timestamp) : fmtTimestamp(entry.timestamp)}
+                      </td>
+                      <td className={`px-3 ${density === 'compact' ? 'py-1' : 'py-1.5'} text-[var(--warn)] truncate max-w-[7rem]`} title={entry.service}>{entry.service}</td>
+                      <td className={`px-3 ${density === 'compact' ? 'py-1' : 'py-1.5'}`}>
                         <span className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] border font-medium ${levelStyle(entry.level)}`}>
                           <span className={`w-1 h-1 rounded-full ${levelDot(entry.level)}`} />
                           {entry.level.toUpperCase()}
                         </span>
                       </td>
-                      <td className="px-3 py-1.5 text-[var(--text)] truncate max-w-0" style={{ maxWidth: 1 }}>
+                      <td className={`px-3 ${density === 'compact' ? 'py-1' : 'py-1.5'} text-[var(--text)] truncate max-w-0`} style={{ maxWidth: 1 }}>
                         <span className="block truncate" title={entry.line}>{entry.line}</span>
                       </td>
                     </tr>
@@ -472,6 +568,21 @@ export default function LogsPage() {
                               <p className="text-[10px] uppercase tracking-wider text-[var(--muted)] mb-1">Message</p>
                               <pre className="text-xs text-[var(--text)] bg-[var(--bg)] rounded border border-[var(--border)] p-3 whitespace-pre-wrap break-words leading-relaxed">{entry.line}</pre>
                             </div>
+                            {showRaw && (
+                              <div className="md:col-span-2">
+                                <p className="text-[10px] uppercase tracking-wider text-[var(--muted)] mb-1">Raw Log JSON</p>
+                                {rawLoadingKey === entry.o3_object_key ? (
+                                  <pre className="text-xs font-mono overflow-auto max-h-[420px] p-3 rounded border border-[var(--border)] bg-[var(--bg)] text-[var(--text)] whitespace-pre-wrap break-words">
+                                    Loading raw log...
+                                  </pre>
+                                ) : (
+                                  <RawJsonViewer
+                                    content={formatRawJsonForEntry(rawByKey[entry.o3_object_key] ?? 'Raw log not loaded', entry)}
+                                    wrap={wrapRaw}
+                                  />
+                                )}
+                              </div>
+                            )}
                             <div className="space-y-2 text-xs">
                               <p className="text-[10px] uppercase tracking-wider text-[var(--muted)]">Metadata</p>
                               <div className="bg-[var(--bg)] rounded border border-[var(--border)] divide-y divide-[var(--border)]">
@@ -505,13 +616,63 @@ export default function LogsPage() {
                               <p className="font-mono text-[var(--accent)] break-all bg-[var(--bg)] rounded border border-[var(--border)] px-3 py-1.5 text-[10px]">{entry.o3_object_key}</p>
                             </div>
                           </div>
-                          <button
-                            type="button"
-                            onClick={e => { e.stopPropagation(); setExpandedIdx(null); }}
-                            className="mt-3 text-[10px] text-[var(--muted)] hover:text-[var(--text)] transition-colors"
-                          >
-                            ▲ collapse
-                          </button>
+                          <div className="mt-3 flex items-center gap-4">
+                            <button
+                              type="button"
+                              onClick={async e => {
+                                e.stopPropagation();
+                                await toggleRawLog(idx, entry.o3_object_key);
+                              }}
+                              className="text-[10px] px-2 py-1 rounded border border-[var(--border)] text-[var(--muted)] hover:text-[var(--accent)] hover:border-[var(--accent)] transition-colors"
+                            >
+                              {showRaw ? 'hide raw log' : 'show raw log'}
+                            </button>
+                            {showRaw && (
+                              <>
+                                <button
+                                  type="button"
+                                  onClick={e => {
+                                    e.stopPropagation();
+                                    setWrapRaw(v => !v);
+                                  }}
+                                  className="text-[10px] px-2 py-1 rounded border border-[var(--border)] text-[var(--muted)] hover:text-[var(--accent)] transition-colors"
+                                >
+                                  {wrapRaw ? 'nowrap' : 'wrap'}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={e => {
+                                    e.stopPropagation();
+                                    void copyText(rawByKey[entry.o3_object_key] ?? '');
+                                  }}
+                                  className="text-[10px] px-2 py-1 rounded border border-[var(--border)] text-[var(--muted)] hover:text-[var(--accent)] transition-colors"
+                                >
+                                  copy raw
+                                </button>
+                              </>
+                            )}
+                            <button
+                              type="button"
+                              onClick={e => {
+                                e.stopPropagation();
+                                void copyText(entry.line);
+                              }}
+                              className="text-[10px] px-2 py-1 rounded border border-[var(--border)] text-[var(--muted)] hover:text-[var(--accent)] transition-colors"
+                            >
+                              copy msg
+                            </button>
+                            <button
+                              type="button"
+                              onClick={e => {
+                                e.stopPropagation();
+                                setExpandedIdx(null);
+                                setRawExpandedIdx(null);
+                              }}
+                              className="text-[10px] px-2 py-1 rounded border border-[var(--border)] text-[var(--muted)] hover:text-[var(--text)] transition-colors"
+                            >
+                              ▲ collapse
+                            </button>
+                          </div>
                         </td>
                       </tr>
                     )}

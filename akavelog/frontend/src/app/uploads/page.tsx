@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { getUploadContent, getUploadRaw, getUploads, type O3ObjectInfo, type StoredLogEntry } from '@/lib/api';
 
@@ -13,6 +13,10 @@ export default function UploadsPage() {
   const [logsLoading, setLogsLoading] = useState(false);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [loadAllLogs, setLoadAllLogs] = useState(false);
+  const [logSearch, setLogSearch] = useState('');
+  const [levelFilter, setLevelFilter] = useState<'all' | 'info' | 'warn' | 'error' | 'debug'>('all');
+  const [expandedLogIndex, setExpandedLogIndex] = useState<number | null>(null);
+  const [rawExpandedLogIndex, setRawExpandedLogIndex] = useState<number | null>(null);
 
   // Raw view state
   const [expandedKey, setExpandedKey] = useState<string | null>(null);
@@ -98,6 +102,36 @@ export default function UploadsPage() {
     if (bytes < 1024) return `${bytes} B`;
     if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  };
+
+  const filteredLogs = useMemo(() => {
+    const q = logSearch.trim().toLowerCase();
+    return storedLogs.filter((log) => {
+      const levelOk = levelFilter === 'all' || (log.level || '').toLowerCase() === levelFilter;
+      if (!levelOk) return false;
+      if (!q) return true;
+      const haystack = [
+        log.timestamp || '',
+        log.service || '',
+        log.level || '',
+        log.message || '',
+        log.raw_request?.method || '',
+        log.raw_request?.path || '',
+        log.raw_request?.query || '',
+        JSON.stringify(log.tags || {}),
+      ]
+        .join(' ')
+        .toLowerCase();
+      return haystack.includes(q);
+    });
+  }, [storedLogs, logSearch, levelFilter]);
+
+  const copyLogJson = async (log: StoredLogEntry) => {
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(log, null, 2));
+    } catch {
+      setError('Failed to copy JSON');
+    }
   };
 
   return (
@@ -252,34 +286,102 @@ export default function UploadsPage() {
             </span>
           )}
         </h2>
+        <div className="flex items-center gap-2 px-4 py-3 border-b border-[var(--border)] flex-wrap">
+          <input
+            type="text"
+            value={logSearch}
+            onChange={(e) => setLogSearch(e.target.value)}
+            placeholder="Search logs..."
+            className="rounded-lg bg-[var(--bg)] border border-[var(--border)] px-3 py-2 text-sm w-56"
+          />
+          <select
+            value={levelFilter}
+            onChange={(e) => setLevelFilter(e.target.value as 'all' | 'info' | 'warn' | 'error' | 'debug')}
+            className="rounded-lg bg-[var(--bg)] border border-[var(--border)] px-3 py-2 text-sm"
+          >
+            <option value="all">All levels</option>
+            <option value="debug">debug</option>
+            <option value="info">info</option>
+            <option value="warn">warn</option>
+            <option value="error">error</option>
+          </select>
+          <span className="text-xs text-[var(--muted)]">
+            {filteredLogs.length} / {storedLogs.length}
+          </span>
+        </div>
         {logsLoading && storedLogs.length === 0 ? (
           <p className="p-4 text-sm text-[var(--muted)]">Loading logs…</p>
         ) : storedLogs.length === 0 ? (
           <p className="p-4 text-sm text-[var(--muted)]">
             Click &quot;View logs&quot; on a batch or &quot;Load all stored logs&quot; to see log entries.
           </p>
+        ) : filteredLogs.length === 0 ? (
+          <p className="p-4 text-sm text-[var(--muted)]">
+            No logs match current filters.
+          </p>
         ) : (
           <div className="overflow-auto p-4 font-mono text-xs">
             <ul className="space-y-1">
-              {storedLogs.map((log, i) => (
+              {filteredLogs.map((log, i) => (
                 <li
                   key={i}
                   className="border-b border-[var(--border)]/50 pb-1 break-words"
                 >
-                  <span className="text-[var(--muted)]">
-                    {log.timestamp ? new Date(log.timestamp).toLocaleString() : '—'}
-                  </span>
-                  {' '}
-                  <span className="text-[var(--warn)]">{log.service ?? '—'}</span>
-                  {' '}
-                  <span className="text-[var(--accent)]">{log.level ?? '—'}</span>
-                  {' '}
-                  {log.message}
-                  {log.raw_request && (
-                    <span className="text-[var(--muted)]">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <span className="text-[var(--muted)]">
+                        {log.timestamp ? new Date(log.timestamp).toLocaleString() : '—'}
+                      </span>
                       {' '}
-                      [{log.raw_request.method} {log.raw_request.path}]
-                    </span>
+                      <span className="text-[var(--warn)]">{log.service ?? '—'}</span>
+                      {' '}
+                      <span className="text-[var(--accent)]">{log.level ?? '—'}</span>
+                      {' '}
+                      {log.message}
+                      {log.raw_request && (
+                        <span className="text-[var(--muted)]">
+                          {' '}
+                          [{log.raw_request.method} {log.raw_request.path}]
+                        </span>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => setExpandedLogIndex(expandedLogIndex === i ? null : i)}
+                        className="text-[var(--muted)] hover:text-[var(--accent)]"
+                      >
+                        {expandedLogIndex === i ? 'Collapse' : 'Expand'}
+                      </button>
+                      {log.raw_request && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setRawExpandedLogIndex(rawExpandedLogIndex === i ? null : i)
+                          }
+                          className="text-[var(--muted)] hover:text-[var(--accent)]"
+                        >
+                          {rawExpandedLogIndex === i ? 'Hide raw log' : 'Show raw log'}
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => copyLogJson(log)}
+                        className="text-[var(--muted)] hover:text-[var(--accent)]"
+                      >
+                        Copy JSON
+                      </button>
+                    </div>
+                  </div>
+                  {expandedLogIndex === i && (
+                    <pre className="mt-2 p-3 rounded-lg bg-[#0e0e0e] border border-[var(--border)] text-[var(--text)] overflow-auto whitespace-pre-wrap">
+                      {JSON.stringify(log, null, 2)}
+                    </pre>
+                  )}
+                  {rawExpandedLogIndex === i && log.raw_request && (
+                    <pre className="mt-2 p-3 rounded-lg bg-[#0e0e0e] border border-[var(--border)] text-[var(--text)] overflow-auto whitespace-pre-wrap">
+                      {JSON.stringify(log.raw_request, null, 2)}
+                    </pre>
                   )}
                 </li>
               ))}
