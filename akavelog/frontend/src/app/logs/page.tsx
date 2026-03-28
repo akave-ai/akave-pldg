@@ -1,13 +1,15 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
-import Link from 'next/link';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  getUploadRaw,
   streamLogs,
   type QueryRequest,
   type QueryResultEntry,
   type SSEDoneEvent,
 } from '@/lib/api';
+import LogsPageHeader from './components/LogsPageHeader';
+import RawJsonViewer from './components/RawJsonViewer';
 
 const LEVELS = ['error', 'warn', 'info', 'debug', 'fatal', 'trace'];
 
@@ -29,6 +31,24 @@ const LEVEL_DOT: Record<string, string> = {
   trace: 'bg-purple-400',
 };
 
+const GRAPH_LEVEL_BADGE: Record<string, string> = {
+  error: 'bg-red-500/20 text-red-300 border-red-400/50',
+  fatal: 'bg-rose-500/20 text-rose-300 border-rose-400/50',
+  warn: 'bg-yellow-500/20 text-yellow-300 border-yellow-400/50',
+  info: 'bg-cyan-500/20 text-cyan-300 border-cyan-400/50',
+  debug: 'bg-zinc-500/20 text-zinc-300 border-zinc-400/50',
+  trace: 'bg-purple-500/20 text-purple-300 border-purple-400/50',
+};
+
+const GRAPH_LEVEL_STROKE: Record<string, string> = {
+  error: '#ef4444',
+  fatal: '#fb7185',
+  warn: '#facc15',
+  info: '#22d3ee',
+  debug: '#a1a1aa',
+  trace: '#a855f7',
+};
+
 /** Rows per page (initial load AND each scroll page). */
 const PAGE_SIZE = 50;
 
@@ -47,6 +67,22 @@ function fmtTimestamp(ts: string): string {
     const ms = String(d.getMilliseconds()).padStart(3, '0');
     return `${date} ${time}.${ms}`;
   } catch { return ts; }
+}
+
+function fmtRelative(ts: string): string {
+  try {
+    const diff = Date.now() - new Date(ts).getTime();
+    const s = Math.max(0, Math.floor(diff / 1000));
+    if (s < 60) return `${s}s ago`;
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m}m ago`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `${h}h ago`;
+    const d = Math.floor(h / 24);
+    return `${d}d ago`;
+  } catch {
+    return ts;
+  }
 }
 
 function toRFC3339(localValue: string): string {
@@ -91,6 +127,12 @@ export default function LogsPage() {
   const [summary, setSummary]        = useState<SSEDoneEvent | null>(null);
   const [streamError, setStreamError] = useState<string | null>(null);
   const [expandedIdx, setExpandedIdx] = useState<number | null>(null);
+  const [rawExpandedIdx, setRawExpandedIdx] = useState<number | null>(null);
+  const [rawByKey, setRawByKey] = useState<Record<string, string>>({});
+  const [rawLoadingKey, setRawLoadingKey] = useState<string | null>(null);
+  const [wrapRaw, setWrapRaw] = useState(true);
+  const [relativeTime, setRelativeTime] = useState(false);
+  const [density, setDensity] = useState<'compact' | 'comfortable'>('comfortable');
   /** Whether there are more pages to load (backend said truncated on last page). */
   const [hasMore, setHasMore] = useState(false);
 
@@ -224,6 +266,12 @@ export default function LogsPage() {
     setStreamError(null);
     setSearchState('idle');
     setExpandedIdx(null);
+    setRawExpandedIdx(null);
+    setRawByKey({});
+    setRawLoadingKey(null);
+    setWrapRaw(true);
+    setRelativeTime(false);
+    setDensity('comfortable');
     setHasMore(false);
     setFilters(DEFAULT_FILTERS);
   };
@@ -238,22 +286,116 @@ export default function LogsPage() {
     if (e.key === 'Enter') handleSearch();
   };
 
+  const formatRawJsonForEntry = (content: string, entry: QueryResultEntry): string => {
+    try {
+      const parsed = JSON.parse(content) as {
+        labels?: Record<string, string>;
+        entries?: Array<{ ts_ns?: number; line?: string }>;
+      };
+      if (Array.isArray(parsed?.entries)) {
+        const matched =
+          parsed.entries.find((e) => Number(e.ts_ns) === Number(entry.ts_ns)) ||
+          parsed.entries.find((e) => (e.line || '') === entry.line);
+        if (matched) {
+          return JSON.stringify(
+            {
+              labels: parsed.labels || {},
+              entry: matched,
+            },
+            null,
+            2
+          );
+        }
+      }
+      return JSON.stringify(parsed, null, 2);
+    } catch {
+      return content;
+    }
+  };
+
+  const toggleRawLog = async (idx: number, objectKey: string) => {
+    if (rawExpandedIdx === idx) {
+      setRawExpandedIdx(null);
+      return;
+    }
+    setRawExpandedIdx(idx);
+    if (rawByKey[objectKey]) return;
+    setRawLoadingKey(objectKey);
+    try {
+      const res = await getUploadRaw(objectKey);
+      setRawByKey(prev => ({ ...prev, [objectKey]: res.content }));
+    } catch (e) {
+      setRawByKey(prev => ({
+        ...prev,
+        [objectKey]: e instanceof Error ? e.message : 'Failed to load raw log',
+      }));
+    } finally {
+      setRawLoadingKey(null);
+    }
+  };
+
+  const copyText = async (text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      // ignore
+    }
+  };
+
+  // Graph uses currently rendered results (after filters/search).
+  const graphLogs = useMemo(() => results, [results]);
+
+  const timelineGraph = useMemo(() => {
+    if (graphLogs.length === 0) return { bars: [] as number[], max: 0, levelBars: {} as Record<string, number[]> };
+    const bucketCount = 40;
+    const buckets = new Array(bucketCount).fill(0);
+    const levelBars: Record<string, number[]> = {};
+    for (const l of LEVELS) levelBars[l] = new Array(bucketCount).fill(0);
+    const times = graphLogs.map((r) => new Date(r.timestamp).getTime()).filter((t) => Number.isFinite(t));
+    if (times.length === 0) return { bars: buckets, max: 0, levelBars };
+    const min = Math.min(...times);
+    const max = Math.max(...times);
+    const span = Math.max(1, max - min);
+    for (const r of graphLogs) {
+      const t = new Date(r.timestamp).getTime();
+      if (!Number.isFinite(t)) continue;
+      const idx = Math.min(bucketCount - 1, Math.floor(((t - min) / span) * bucketCount));
+      buckets[idx] += 1;
+      const lvl = (r.level || 'info').toLowerCase();
+      if (levelBars[lvl]) levelBars[lvl][idx] += 1;
+    }
+    return { bars: buckets, max: Math.max(...buckets), levelBars };
+  }, [graphLogs]);
+
+  const levelCounts = useMemo(() => {
+    const out: Record<string, number> = { error: 0, warn: 0, info: 0, debug: 0, fatal: 0, trace: 0 };
+    for (const r of graphLogs) {
+      const l = (r.level || 'info').toLowerCase();
+      if (out[l] !== undefined) out[l] += 1;
+    }
+    return out;
+  }, [graphLogs]);
+
+  const timelineBounds = useMemo(() => {
+    const times = graphLogs
+      .map((r) => new Date(r.timestamp).getTime())
+      .filter((t) => Number.isFinite(t))
+      .sort((a, b) => a - b);
+    if (times.length === 0) return null;
+    const start = times[0];
+    const end = times[times.length - 1];
+    const mid = Math.floor((start + end) / 2);
+    return { start, mid, end };
+  }, [graphLogs]);
+
   // ── Render ──────────────────────────────────────────────────────────────────
   return (
     <div className="h-screen flex flex-col bg-[var(--bg)] overflow-hidden">
 
-      {/* Navigation */}
-      <header className="shrink-0 border-b border-[var(--border)] px-4 py-2 flex items-center gap-4 flex-wrap">
-        <Link href="/" className="text-[var(--muted)] hover:text-[var(--accent)] text-sm transition-colors">← Home</Link>
-        <span className="text-[var(--accent)] font-semibold tracking-wide text-sm">LOG EXPLORER</span>
-        <div className="ml-auto flex items-center gap-3 text-xs text-[var(--muted)]">
-          <Link href="/uploads" className="hover:text-[var(--accent)] transition-colors">O3 Uploads</Link>
-          <Link href="/stored"  className="hover:text-[var(--accent)] transition-colors">Stored Data</Link>
-        </div>
-      </header>
+      <LogsPageHeader />
 
       {/* Filter bar */}
-      <div className="shrink-0 border-b border-[var(--border)] bg-[var(--card)] px-4 py-3 space-y-3">
+      <div className="shrink-0 border-b border-[var(--border)] bg-[var(--card)] px-4 py-3 space-y-3 shadow-sm">
 
         {/* Row 1: time range */}
         <div className="flex flex-wrap gap-3 items-center">
@@ -364,6 +506,20 @@ export default function LogsPage() {
           <div className="flex gap-2 ml-auto">
             <button
               type="button"
+              onClick={() => setRelativeTime(v => !v)}
+              className="px-2 py-1.5 rounded text-xs border border-[var(--border)] text-[var(--muted)] hover:text-[var(--accent)] transition-colors"
+            >
+              {relativeTime ? 'Absolute time' : 'Relative time'}
+            </button>
+            <button
+              type="button"
+              onClick={() => setDensity(v => (v === 'compact' ? 'comfortable' : 'compact'))}
+              className="px-2 py-1.5 rounded text-xs border border-[var(--border)] text-[var(--muted)] hover:text-[var(--accent)] transition-colors"
+            >
+              {density === 'compact' ? 'Comfortable rows' : 'Compact rows'}
+            </button>
+            <button
+              type="button"
               onClick={handleClear}
               className="px-3 py-1.5 rounded text-xs border border-[var(--border)] text-[var(--muted)] hover:text-red-400 hover:border-red-400/50 transition-colors"
             >
@@ -390,41 +546,113 @@ export default function LogsPage() {
         </div>
       </div>
 
-      {/* Status bar */}
-      <div className="shrink-0 border-b border-[var(--border)] px-4 py-1.5 flex items-center gap-4 text-xs text-[var(--muted)]">
-        {searchState === 'streaming' && !hasMore && (
-          <span className="flex items-center gap-1.5">
-            <span className="inline-block w-1.5 h-1.5 rounded-full bg-[var(--accent)] animate-pulse" />
-            loading…
-          </span>
-        )}
-        {searchState === 'streaming' && hasMore && (
-          <span className="flex items-center gap-1.5">
-            <span className="inline-block w-1.5 h-1.5 rounded-full bg-[var(--accent)] animate-pulse" />
-            loading more…
-          </span>
-        )}
-        {searchState === 'done' && summary && (
-          <span className="text-[var(--success)]">
-            ✓ {summary.count} result{summary.count !== 1 ? 's' : ''}
-            {hasMore && <span className="text-[var(--warn)] ml-2">· scroll for more ↓</span>}
-          </span>
-        )}
-        {searchState === 'error' && <span className="text-red-400">✗ {streamError}</span>}
-        {searchState === 'idle' && results.length === 0 && (
-          <span>Set filters and click Search, or results will load automatically.</span>
-        )}
-        {results.length > 0 && (
-          <span className="ml-auto">{results.length} entries loaded</span>
-        )}
-      </div>
 
-      {/* Log table */}
-      <div
-        ref={listRef}
-        onScroll={handleScroll}
-        className="flex-1 overflow-y-auto font-mono text-xs"
-      >
+
+      {/* Top graph (latest 200) */}
+      <section className="shrink-0 border-b border-[var(--border)] bg-[var(--card)]/60 px-4 py-3">
+        <div className="flex items-center justify-between mb-2">
+          <h3 className="text-xs uppercase tracking-wider text-[var(--muted)] font-semibold">
+            Live Graph (current results)
+          </h3>
+          <span className="text-[10px] text-[var(--muted)]">
+            updates from rendered filtered logs
+          </span>
+        </div>
+        <div className="rounded border border-[var(--border)] bg-[var(--bg)] p-3">
+          <div className="h-64 border border-[var(--border)]/60 rounded-md bg-[var(--card)]/30 p-2">
+            {graphLogs.length === 0 ? (
+              <div className="h-full flex items-center justify-center text-[10px] text-[var(--muted)]">
+                No log data yet
+              </div>
+            ) : (
+              <svg className="w-full h-full" viewBox="0 0 1000 240" preserveAspectRatio="none">
+                <line x1="0" y1="239" x2="1000" y2="239" stroke="rgba(255,255,255,0.25)" strokeWidth="1" />
+                {LEVELS.map((lvl) => {
+                  const arr = timelineGraph.levelBars[lvl] || [];
+                  if (arr.length === 0 || timelineGraph.max <= 0) return null;
+                  const points = arr
+                    .map((v, i) => {
+                      const x = (i / Math.max(1, arr.length - 1)) * 1000;
+                      const y = 239 - (v / timelineGraph.max) * 220;
+                      return `${x},${Math.max(6, y)}`;
+                    })
+                    .join(' ');
+                  return (
+                    <polyline
+                      key={lvl}
+                      fill="none"
+                      stroke={GRAPH_LEVEL_STROKE[lvl] || '#22d3ee'}
+                      strokeWidth="2"
+                      points={points}
+                      opacity="0.95"
+                    />
+                  );
+                })}
+              </svg>
+            )}
+          </div>
+          <div className="mt-2 flex items-center justify-between text-[10px] text-[var(--muted)]">
+            <span>{timelineBounds ? fmtTimestamp(new Date(timelineBounds.start).toISOString()) : '—'}</span>
+            <span>{timelineBounds ? fmtTimestamp(new Date(timelineBounds.mid).toISOString()) : '—'}</span>
+            <span>{timelineBounds ? fmtTimestamp(new Date(timelineBounds.end).toISOString()) : '—'}</span>
+          </div>
+          <div className="mt-1 h-1 rounded bg-[var(--border)]/40 relative overflow-hidden">
+            <div className="absolute left-0 top-0 h-full w-px bg-[var(--muted)]/80" />
+            <div className="absolute left-1/2 top-0 h-full w-px bg-[var(--muted)]/60" />
+            <div className="absolute right-0 top-0 h-full w-px bg-[var(--muted)]/80" />
+          </div>
+
+          <div className="mt-3 flex flex-wrap gap-2 text-[10px]">
+            {LEVELS.map((l) => (
+              <span
+                key={l}
+                className={`px-2 py-0.5 rounded border font-semibold ${GRAPH_LEVEL_BADGE[l] ?? 'bg-[var(--card)] text-[var(--text)] border-[var(--border)]'}`}
+              >
+                {l}: {levelCounts[l] ?? 0}
+              </span>
+            ))}
+          </div>
+        </div>
+      </section>
+      {/* Bottom logs list in separate container */}
+      <div className="flex-1 min-h-0 flex flex-col">
+        <div className="shrink-0 px-4 py-2 border-b border-[var(--border)] bg-[var(--card)]/50">
+          <h3 className="text-xs uppercase tracking-wider text-[var(--muted)] font-semibold">
+            Logs List (newest at top)
+          </h3>
+        </div>
+        <div className="shrink-0 border-b border-[var(--border)] bg-[var(--card)]/35 px-4 py-2 flex items-center gap-4 text-xs text-[var(--muted)]">
+          {searchState === 'streaming' && !hasMore && (
+            <span className="flex items-center gap-1.5">
+              <span className="inline-block w-1.5 h-1.5 rounded-full bg-[var(--accent)] animate-pulse" />
+              loading…
+            </span>
+          )}
+          {searchState === 'streaming' && hasMore && (
+            <span className="flex items-center gap-1.5">
+              <span className="inline-block w-1.5 h-1.5 rounded-full bg-[var(--accent)] animate-pulse" />
+              loading more…
+            </span>
+          )}
+          {searchState === 'done' && summary && (
+            <span className="text-[var(--success)]">
+              ✓ {results.length} result{results.length !== 1 ? 's' : ''}
+              {hasMore && <span className="text-[var(--warn)] ml-2">· scroll for more ↓</span>}
+            </span>
+          )}
+          {searchState === 'error' && <span className="text-red-400">✗ {streamError}</span>}
+          {searchState === 'idle' && results.length === 0 && (
+            <span>Set filters and click Search, or results will load automatically.</span>
+          )}
+          {results.length > 0 && (
+            <span className="ml-auto text-[var(--muted)]/90">{results.length} entries loaded</span>
+          )}
+        </div>
+        <div
+          ref={listRef}
+          onScroll={handleScroll}
+          className="flex-1 overflow-y-auto font-mono text-xs"
+        >
         {results.length === 0 && searchState !== 'streaming' ? (
           <div className="flex flex-col items-center justify-center h-full text-[var(--muted)] gap-2">
             <span className="text-2xl opacity-30">⌕</span>
@@ -443,24 +671,27 @@ export default function LogsPage() {
             <tbody>
               {results.map((entry, idx) => {
                 const isExpanded = expandedIdx === idx;
+                const showRaw = rawExpandedIdx === idx;
                 return (
                   <>
                     <tr
                       key={`${entry.ts_ns}-${idx}`}
                       onClick={() => setExpandedIdx(isExpanded ? null : idx)}
                       className={`border-b border-[var(--border)]/40 cursor-pointer transition-colors ${
-                        isExpanded ? 'bg-[var(--card)]' : 'hover:bg-[var(--card)]/60'
+                        isExpanded ? 'bg-[var(--card)]' : 'hover:bg-[var(--card)]/70'
                       }`}
                     >
-                      <td className="px-3 py-1.5 text-[var(--muted)] whitespace-nowrap">{fmtTimestamp(entry.timestamp)}</td>
-                      <td className="px-3 py-1.5 text-[var(--warn)] truncate max-w-[7rem]" title={entry.service}>{entry.service}</td>
-                      <td className="px-3 py-1.5">
+                      <td className={`px-3 ${density === 'compact' ? 'py-1' : 'py-1.5'} text-[var(--muted)] whitespace-nowrap`}>
+                        {relativeTime ? fmtRelative(entry.timestamp) : fmtTimestamp(entry.timestamp)}
+                      </td>
+                      <td className={`px-3 ${density === 'compact' ? 'py-1' : 'py-1.5'} text-[var(--warn)] truncate max-w-[7rem]`} title={entry.service}>{entry.service}</td>
+                      <td className={`px-3 ${density === 'compact' ? 'py-1' : 'py-1.5'}`}>
                         <span className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] border font-medium ${levelStyle(entry.level)}`}>
                           <span className={`w-1 h-1 rounded-full ${levelDot(entry.level)}`} />
                           {entry.level.toUpperCase()}
                         </span>
                       </td>
-                      <td className="px-3 py-1.5 text-[var(--text)] truncate max-w-0" style={{ maxWidth: 1 }}>
+                      <td className={`px-3 ${density === 'compact' ? 'py-1' : 'py-1.5'} text-[var(--text)] truncate max-w-0`} style={{ maxWidth: 1 }}>
                         <span className="block truncate" title={entry.line}>{entry.line}</span>
                       </td>
                     </tr>
@@ -473,6 +704,21 @@ export default function LogsPage() {
                               <p className="text-[10px] uppercase tracking-wider text-[var(--muted)] mb-1">Message</p>
                               <pre className="text-xs text-[var(--text)] bg-[var(--bg)] rounded border border-[var(--border)] p-3 whitespace-pre-wrap break-words leading-relaxed">{entry.line}</pre>
                             </div>
+                            {showRaw && (
+                              <div className="md:col-span-2">
+                                <p className="text-[10px] uppercase tracking-wider text-[var(--muted)] mb-1">Raw Log JSON</p>
+                                {rawLoadingKey === entry.o3_object_key ? (
+                                  <pre className="text-xs font-mono overflow-auto max-h-[420px] p-3 rounded border border-[var(--border)] bg-[var(--bg)] text-[var(--text)] whitespace-pre-wrap break-words">
+                                    Loading raw log...
+                                  </pre>
+                                ) : (
+                                  <RawJsonViewer
+                                    content={formatRawJsonForEntry(rawByKey[entry.o3_object_key] ?? 'Raw log not loaded', entry)}
+                                    wrap={wrapRaw}
+                                  />
+                                )}
+                              </div>
+                            )}
                             <div className="space-y-2 text-xs">
                               <p className="text-[10px] uppercase tracking-wider text-[var(--muted)]">Metadata</p>
                               <div className="bg-[var(--bg)] rounded border border-[var(--border)] divide-y divide-[var(--border)]">
@@ -506,13 +752,63 @@ export default function LogsPage() {
                               <p className="font-mono text-[var(--accent)] break-all bg-[var(--bg)] rounded border border-[var(--border)] px-3 py-1.5 text-[10px]">{entry.o3_object_key}</p>
                             </div>
                           </div>
-                          <button
-                            type="button"
-                            onClick={e => { e.stopPropagation(); setExpandedIdx(null); }}
-                            className="mt-3 text-[10px] text-[var(--muted)] hover:text-[var(--text)] transition-colors"
-                          >
-                            ▲ collapse
-                          </button>
+                          <div className="mt-3 flex items-center gap-4">
+                            <button
+                              type="button"
+                              onClick={async e => {
+                                e.stopPropagation();
+                                await toggleRawLog(idx, entry.o3_object_key);
+                              }}
+                              className="text-[10px] px-2 py-1 rounded border border-[var(--border)] text-[var(--muted)] hover:text-[var(--accent)] hover:border-[var(--accent)] transition-colors"
+                            >
+                              {showRaw ? 'hide raw log' : 'show raw log'}
+                            </button>
+                            {showRaw && (
+                              <>
+                                <button
+                                  type="button"
+                                  onClick={e => {
+                                    e.stopPropagation();
+                                    setWrapRaw(v => !v);
+                                  }}
+                                  className="text-[10px] px-2 py-1 rounded border border-[var(--border)] text-[var(--muted)] hover:text-[var(--accent)] transition-colors"
+                                >
+                                  {wrapRaw ? 'nowrap' : 'wrap'}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={e => {
+                                    e.stopPropagation();
+                                    void copyText(rawByKey[entry.o3_object_key] ?? '');
+                                  }}
+                                  className="text-[10px] px-2 py-1 rounded border border-[var(--border)] text-[var(--muted)] hover:text-[var(--accent)] transition-colors"
+                                >
+                                  copy raw
+                                </button>
+                              </>
+                            )}
+                            <button
+                              type="button"
+                              onClick={e => {
+                                e.stopPropagation();
+                                void copyText(entry.line);
+                              }}
+                              className="text-[10px] px-2 py-1 rounded border border-[var(--border)] text-[var(--muted)] hover:text-[var(--accent)] transition-colors"
+                            >
+                              copy msg
+                            </button>
+                            <button
+                              type="button"
+                              onClick={e => {
+                                e.stopPropagation();
+                                setExpandedIdx(null);
+                                setRawExpandedIdx(null);
+                              }}
+                              className="text-[10px] px-2 py-1 rounded border border-[var(--border)] text-[var(--muted)] hover:text-[var(--text)] transition-colors"
+                            >
+                              ▲ collapse
+                            </button>
+                          </div>
                         </td>
                       </tr>
                     )}
@@ -545,6 +841,7 @@ export default function LogsPage() {
             — end of results —
           </div>
         )}
+        </div>
       </div>
     </div>
   );

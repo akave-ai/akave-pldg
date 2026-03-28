@@ -2,17 +2,14 @@ package storage
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"strings"
+	"path"
 	"time"
 
 	"github.com/akave-ai/akavelog/internal/config"
-	"github.com/akave-ai/akavelog/internal/model"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -84,6 +81,15 @@ func (c *O3Client) PutObject(ctx context.Context, key string, data []byte, conte
 	return err
 }
 
+// KeyForBatch returns an object key for a log batch (e.g. logs/default/2024/02/17/abc123.json.gz).
+func KeyForBatch(projectID string, batchID string, ext string) string {
+	if projectID == "" {
+		projectID = "default"
+	}
+	now := time.Now().UTC()
+	return path.Join("logs", projectID, now.Format("2006/01/02"), batchID+ext)
+}
+
 // ObjectInfo describes an object in O3 (for list response).
 type ObjectInfo struct {
 	Key          string    `json:"key"`
@@ -128,102 +134,4 @@ func (c *O3Client) GetObject(ctx context.Context, key string) ([]byte, error) {
 	}
 	defer out.Body.Close()
 	return io.ReadAll(out.Body)
-}
-
-// GetObjectLogs downloads a gzipped JSON batch by key and returns the log entries.
-func (c *O3Client) GetObjectLogs(ctx context.Context, key string) ([]model.LogEntry, error) {
-	raw, err := c.GetObject(ctx, key)
-	if err != nil {
-		return nil, err
-	}
-	zr, err := gzip.NewReader(bytes.NewReader(raw))
-	if err != nil {
-		return nil, fmt.Errorf("gzip: %w", err)
-	}
-	defer zr.Close()
-	decoded, err := io.ReadAll(zr)
-	if err != nil {
-		return nil, fmt.Errorf("read: %w", err)
-	}
-
-	// Support both:
-	// 1) Legacy format: gzip JSON []model.LogEntry
-	// 2) Current format: gzip JSON {labels: {...}, entries:[{ts_ns, line}, ...]}
-	var legacy []model.LogEntry
-	if err := json.Unmarshal(decoded, &legacy); err == nil {
-		return legacy, nil
-	}
-
-	type entryPayload struct {
-		TsNs int64  `json:"ts_ns"`
-		Line string `json:"line"`
-	}
-	type chunkPayload struct {
-		Labels  map[string]string `json:"labels"`
-		Entries []entryPayload    `json:"entries"`
-	}
-
-	var payload chunkPayload
-	if err := json.Unmarshal(decoded, &payload); err != nil {
-		return nil, fmt.Errorf("json: %w", err)
-	}
-
-	extractService := func(labels map[string]string) string {
-		service := "akavelog"
-		if labels == nil {
-			return service
-		}
-		for _, k := range []string{"job", "app", "service"} {
-			if v := labels[k]; v != "" {
-				return v
-			}
-		}
-		return service
-	}
-
-	extractLevel := func(labels map[string]string) string {
-		if labels == nil {
-			return ""
-		}
-		return labels["level"]
-	}
-
-	extractLevelFromLine := func(line string) string {
-		upper := strings.ToUpper(line)
-		for _, lvl := range []string{"FATAL", "ERROR", "WARN", "WARNING", "INFO", "DEBUG", "TRACE"} {
-			if strings.HasPrefix(upper, lvl+":") ||
-				strings.HasPrefix(upper, "["+lvl+"]") ||
-				strings.HasPrefix(upper, lvl+" ") {
-				if lvl == "WARNING" {
-					return "warn"
-				}
-				return strings.ToLower(lvl)
-			}
-		}
-		return ""
-	}
-
-	service := extractService(payload.Labels)
-	baseLevel := extractLevel(payload.Labels)
-
-	out := make([]model.LogEntry, 0, len(payload.Entries))
-	for _, e := range payload.Entries {
-		level := baseLevel
-		if l := extractLevelFromLine(e.Line); l != "" {
-			level = l
-		}
-		if level == "" {
-			level = "info"
-		}
-
-		out = append(out, model.LogEntry{
-			Timestamp: time.Unix(0, e.TsNs).UTC().Format(time.RFC3339Nano),
-			Service:   service,
-			Level:     level,
-			Message:   e.Line,
-			Tags:      payload.Labels,
-		})
-	}
-
-	return out, nil
 }
