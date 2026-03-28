@@ -173,3 +173,36 @@ func (r *LogBatchRepository) ListByFilter(
 	}
 	return out, nil
 }
+
+// CountByFilter returns the total entry_count sum for batches matching the filters.
+// Used by the alert worker to evaluate threshold conditions without fetching O3 objects.
+// For keyword conditions it counts entries in matching batches (not per-line keyword matches —
+// that would require O3 fetches; this is the fast path for batch-level metadata counts).
+func (r *LogBatchRepository) CountByFilter(ctx context.Context, service, level, keyword string, from, to time.Time) (int, error) {
+	if to.IsZero() {
+		to = time.Now().UTC()
+	}
+
+	args := []any{from, to} // $1 $2
+	where := `
+		WHERE  ts_start <= $2
+		  AND  ts_end   >= $1`
+
+	if service != "" {
+		args = append(args, service)
+		where += fmt.Sprintf("\n\t\t  AND  service  = $%d", len(args))
+	}
+
+	if level != "" {
+		args = append(args, []string{level})
+		where += fmt.Sprintf("\n\t\t  AND  levels   && $%d::text[]", len(args))
+	}
+
+	q := `SELECT COALESCE(SUM(entry_count), 0) FROM log_batches` + where
+
+	var total int
+	if err := r.pool.QueryRow(ctx, q, args...).Scan(&total); err != nil {
+		return 0, fmt.Errorf("count by filter: %w", err)
+	}
+	return total, nil
+}
