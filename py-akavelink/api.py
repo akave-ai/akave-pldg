@@ -1,12 +1,15 @@
 from fastapi import FastAPI, HTTPException, File, UploadFile, Form
+from fastapi.responses import StreamingResponse
 from datetime import datetime
 import uuid
 import asyncpg
 import os
+import io 
+import asyncio
 import shutil
 import tempfile
-from worker import create_bucket_task
-from schemas import BucketCreateRequest, BucketCreateResponse, JobStatus, JobStatusResponse, BucketDeleteRequest, BucketDeleteResponse, FileUploadRequest, FileUploadResponse
+from worker import create_bucket_task, get_akave_sdk
+from schemas import BucketCreateRequest, BucketCreateResponse, JobStatus, JobStatusResponse, BucketDeleteRequest, BucketDeleteResponse, FileUploadRequest, FileUploadResponse, FileDeleteResponse, FileJobStatusResponse
 
 app = FastAPI(title="py-akavelink")
 
@@ -202,3 +205,90 @@ async def upload_file(bucket_name: str = Form(...), file: UploadFile = File(...)
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to upload file: {str(e)}")
+    
+@app.post("/files/delete", response_model=FileDeleteResponse)
+async def delete_file(request: FileDeleteRequest):
+    job_id = str(uuid.uuid4())
+    created_at = datetime.now()
+    file_name = request.file_name
+    
+    try: 
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO file_jobs (id, job_type, bucket_name, file_name, status, created_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                """,
+                job_id,
+                "delete",
+                request.bucket_name,
+                file_name,
+                "queued",
+                created_at,
+                created_at,
+            )
+            
+        # delete_file_task.delay(job_id, bucket_name, file_name)  # TODO: wire in worker
+        return FileDeleteResponse(
+                job_id=job_id,
+                bucket_name=request.bucket_name,
+                file_name=file_name,
+                status=JobStatus.queued,
+            )
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to queue file deletion: {str(e)}")
+
+@app.get(f"/files/{bucket_name}/{file_name}/download")
+async def download_file(bucket_name: str, file_name: str):
+    
+    def _do_download():
+        sdk = get_akave_sdk()
+        ipc = sdk.ipc()
+        download_manifest = ipc.create_file_download(None, bucket_name, file_name)
+        buffer = io.BytesIO()
+        ipc.download(None, download_manifest, buffer)
+        sdk.close()
+        buffer.seek(0)
+        return buffer
+    
+    try:
+        buffer = await asyncio.to_thread(_do_download)
+        return StreamingResponse(buffer, media_type="application/octet-stream",
+                                 headers={
+            "Content-Disposition": f"attachment; filename={file_name}"
+        })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to download file: {str(e)}")
+    
+@app.get("/files/jobs/{job_id}", response_model=FileJobStatusResponse)
+async def get_file_job_status(job_id: str):
+    try:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT id, bucket_name, file_name, status, root_cid,
+                       encoded_size, actual_size, error, created_at, updated_at
+                FROM file_jobs
+                WHERE id = $1
+            """, job_id)
+
+        if not row:
+            raise HTTPException(status_code=404, detail="File job not found")
+
+        return FileJobStatusResponse(
+            job_id=str(row['id']),
+            bucket_name=row['bucket_name'],
+            file_name=row['file_name'],
+            status=JobStatus(row['status']),
+            root_cid=row['root_cid'],
+            encoded_size=row['encoded_size'],
+            actual_size=row['actual_size'],
+            error=row['error'],
+            created_at=row['created_at'],
+            updated_at=row['updated_at'],
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")

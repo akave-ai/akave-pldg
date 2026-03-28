@@ -88,22 +88,6 @@ class FileDeleteResponse(BaseModel):
     status: JobStatus
 
 
-class FileDownloadRequest(BaseModel):
-    bucket_name: str
-    file_name: str
-
-
-class FileDownloadResponse(BaseModel):
-    job_id: str
-    bucket_name: str
-    file_name: str
-    file_path: str
-    file_size: int
-    chunks: int
-    blocks: int
-    status: JobStatus
-
-
 class IPCBucketCreateResult(BaseModel):
     id: str
     name: str
