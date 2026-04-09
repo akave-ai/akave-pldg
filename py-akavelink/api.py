@@ -8,7 +8,7 @@ import io
 import asyncio
 import shutil
 import tempfile
-from worker import create_bucket_task, get_akave_sdk
+from worker import create_bucket_task, delete_bucket_task, get_akave_sdk
 from schemas import BucketCreateRequest, BucketCreateResponse, JobStatus, JobStatusResponse, BucketDeleteRequest, BucketDeleteResponse, FileUploadRequest, FileUploadResponse, FileDeleteResponse, FileJobStatusResponse
 
 app = FastAPI(title="py-akavelink")
@@ -96,8 +96,7 @@ async def delete_bucket(request: BucketDeleteRequest):
                 created_at,
             )
 
-        # TODO: implement delete_bucket_task in worker.py and call it here
-        # delete_bucket_task.delay(job_id, request.bucket_name)
+        delete_bucket_task.delay(job_id, request.bucket_name)
 
         return BucketDeleteResponse(
             job_id=job_id,
@@ -192,6 +191,8 @@ async def upload_file(bucket_name: str = Form(...), file: UploadFile = File(...)
                 bucket_name,
                 file_name,
                 "queued",
+                created_at,
+                created_at,
             )
             
         # upload_file_task.delay(job_id, bucket_name, file_name, temp_path)  # TODO: wire in worker
@@ -239,7 +240,7 @@ async def delete_file(request: FileDeleteRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to queue file deletion: {str(e)}")
 
-@app.get(f"/files/{bucket_name}/{file_name}/download")
+@app.get("/files/{bucket_name}/{file_name}/download")
 async def download_file(bucket_name: str, file_name: str):
     
     def _do_download():
