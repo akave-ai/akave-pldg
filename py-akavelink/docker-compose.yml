@@ -49,6 +49,7 @@ services:
       - AKAVE_NODE_ADDRESS=connect.akave.ai:5500
     volumes:
       - .:/app
+      - uploads_tmp:/tmp/akave_uploads
     depends_on:
       postgres:
         condition: service_healthy
@@ -71,6 +72,7 @@ services:
       - AKAVE_NODE_ADDRESS=connect.akave.ai:5500
     volumes:
       - .:/app
+      - uploads_tmp:/tmp/akave_uploads
     depends_on:
       postgres:
         condition: service_healthy
@@ -80,3 +82,4 @@ services:
 
 volumes:
   postgres_data:
+  uploads_tmp:

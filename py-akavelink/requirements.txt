@@ -10,3 +10,4 @@ git+https://github.com/akave-ai/akavesdk-py.git
 pydantic>=2.0.0
 
 httpx>=0.25.0
+python-multipart>=0.0.7

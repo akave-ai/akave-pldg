@@ -8,8 +8,8 @@ import io
 import asyncio
 import shutil
 import tempfile
-from worker import create_bucket_task, delete_bucket_task, get_akave_sdk
-from schemas import BucketCreateRequest, BucketCreateResponse, JobStatus, JobStatusResponse, BucketDeleteRequest, BucketDeleteResponse, FileUploadRequest, FileUploadResponse, FileDeleteResponse, FileJobStatusResponse
+from worker import create_bucket_task, delete_bucket_task, get_akave_sdk, upload_file_task, delete_file_task
+from schemas import BucketCreateRequest, BucketCreateResponse, JobStatus, JobStatusResponse, BucketDeleteRequest, BucketDeleteResponse,  FileUploadResponse, FileDeleteResponse, FileJobStatusResponse, FileDeleteRequest
 
 app = FastAPI(title="py-akavelink")
 
@@ -195,7 +195,7 @@ async def upload_file(bucket_name: str = Form(...), file: UploadFile = File(...)
                 created_at,
             )
             
-        # upload_file_task.delay(job_id, bucket_name, file_name, temp_path)  # TODO: wire in worker
+        upload_file_task.delay(job_id, bucket_name, file_name, temp_path) 
 
         return FileUploadResponse(
             job_id=job_id,
@@ -211,7 +211,6 @@ async def upload_file(bucket_name: str = Form(...), file: UploadFile = File(...)
 async def delete_file(request: FileDeleteRequest):
     job_id = str(uuid.uuid4())
     created_at = datetime.now()
-    file_name = request.file_name
     
     try: 
         async with db_pool.acquire() as conn:
@@ -229,7 +228,7 @@ async def delete_file(request: FileDeleteRequest):
                 created_at,
             )
             
-        # delete_file_task.delay(job_id, bucket_name, file_name)  # TODO: wire in worker
+        delete_file_task.delay(job_id, request.bucket_name, request.file_name) 
         return FileDeleteResponse(
                 job_id=job_id,
                 bucket_name=request.bucket_name,

@@ -3,6 +3,7 @@ from akavesdk import SDK, SDKConfig
 import asyncpg
 import os
 import logging
+import shutil
 from datetime import datetime
 
 logging.basicConfig(level=logging.INFO)
@@ -149,7 +150,7 @@ def delete_bucket_task(self, job_id: str, bucket_name: str):
         logger.info(f"[Job {job_id}] Deleting bucket on Akave...")
         ipc.delete_bucket(None, bucket_name)
         
-        logger.info(f"[Job] {job_id}] Bucket deleted successfully!")
+        logger.info(f"[Job {job_id}] Bucket deleted successfully!")
         asyncio.run(update_job_status(job_id, "completed", tx_hash=None, error=None))
         
         sdk.close()
@@ -168,4 +169,82 @@ def delete_bucket_task(self, job_id: str, bucket_name: str):
         
         asyncio.run(update_job_status(job_id, "failed", tx_hash=None, error=error_msg))
         
+        raise
+    
+@celery_app.task(bind=True, max_retries=3, default_retry_delay=10)
+def upload_file_task(self, job_id: str, bucket_name: str, file_name: str, temp_path: str):
+    import asyncio
+    
+    logger.info(f"[Job {job_id}] Starting file upload: {file_name} -> {bucket_name}")
+    
+    try:
+        asyncio.run(update_file_job_status(job_id, "processing"))
+        
+        logger.info(f"[Job {job_id}] Initializing Akave SDK...")
+        sdk = get_akave_sdk()
+        ipc = sdk.ipc()
+        
+        logger.info(f"[Job {job_id}] Uploading file to Akave...")
+        with open(temp_path, "rb") as reader:
+            result = ipc.upload(None, bucket_name, file_name, reader) 
+            
+        logger.info(f"[Job {job_id}] File uploaded successfully! CID: {result.root_cid}")
+        
+        asyncio.run(update_file_job_status(job_id, "completed", root_cid=result.root_cid, encoded_size=result.encoded_size, actual_size=result.size))
+        
+        sdk.close()
+        
+        upload_dir = os.path.dirname(temp_path)
+        shutil.rmtree(upload_dir, ignore_errors=True)
+        
+        return {
+            "status": "completed",
+            "root_cid": result.root_cid,
+            "encoded_size": result.encoded_size,
+            "actual_size": result.size,
+        }
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"[Job {job_id}] File upload failed: {error_msg}")
+        
+        if self.request.retries < self.max_retries:
+            raise self.retry(exc=e)
+        
+        asyncio.run(update_file_job_status(job_id, "failed", root_cid=None, encoded_size=None, actual_size=None, error=error_msg))     
+        raise
+    
+@celery_app.task(bind=True, max_retries=3, default_retry_delay=10)
+def delete_file_task(self, job_id:str, bucket_name:str, file_name:str):
+    import asyncio 
+    
+    logger.info(f"[Job {job_id}] Starting file deletion: {file_name} -> {bucket_name}")
+    
+    try:
+        asyncio.run(update_file_job_status(job_id, "processing"))
+        
+        logger.info(f"[Job {job_id}] Initializing Akave SDK...")
+        sdk = get_akave_sdk()
+        ipc = sdk.ipc()
+        
+        logger.info(f"[Job {job_id}] Deleting file from Akave...")
+        ipc.file_delete(None, bucket_name, file_name)
+        
+        logger.info(f"[Job {job_id}] File deleted successfully!")
+        asyncio.run(update_file_job_status(job_id, "completed", root_cid=None, encoded_size=None, actual_size=None, error=None))
+        
+        sdk.close()
+        
+        return {
+            "status": "completed",
+            "bucket_name": bucket_name,
+            "file_name": file_name,
+        }
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"[Job {job_id}] File deletion failed: {error_msg}")
+        
+        if self.request.retries < self.max_retries:
+            raise self.retry(exc=e)
+        
+        asyncio.run(update_file_job_status(job_id, "failed", root_cid=None, encoded_size=None, actual_size=None, error=error_msg))
         raise

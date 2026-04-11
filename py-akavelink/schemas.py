@@ -27,7 +27,7 @@ class BucketCreateRequest(BaseModel):
         ...,
         min_length=3,
         max_length=255,
-        regex=r"^[a-zA-Z0-9-]+$",
+        pattern=r"^[a-zA-Z0-9-]+$",
     )
 
 
@@ -42,7 +42,7 @@ class BucketDeleteRequest(BaseModel):
         ...,
         min_length=3,
         max_length=255,
-        regex=r"^[a-zA-Z0-9-]+$",
+        pattern=r"^[a-zA-Z0-9-]+$",
     )
 
 
@@ -50,12 +50,6 @@ class BucketDeleteResponse(BaseModel):
     job_id: str
     bucket_name: str
     status: JobStatus
-
-
-class FileUploadRequest(BaseModel):
-    bucket_name: str
-    file_name: str
-    file_path: str
 
 
 class FileUploadResponse(BaseModel):
