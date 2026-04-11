@@ -165,7 +165,97 @@ async def list_buckets():
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-    
+
+
+@app.get("/jobs/summary")
+async def jobs_summary():
+    try:
+        async with db_pool.acquire() as conn:
+            bucket_rows = await conn.fetch("""
+                SELECT status, COUNT(*) as count
+                FROM bucket_jobs
+                GROUP BY status
+            """)
+            file_rows = await conn.fetch("""
+                SELECT status, COUNT(*) as count
+                FROM file_jobs
+                GROUP BY status
+            """)
+
+        bucket = {row['status']: row['count'] for row in bucket_rows}
+        files = {row['status']: row['count'] for row in file_rows}
+
+        return {
+            "bucket_jobs": {
+                "queued":     bucket.get("queued", 0),
+                "processing": bucket.get("processing", 0),
+                "completed":  bucket.get("completed", 0),
+                "failed":     bucket.get("failed", 0),
+            },
+            "file_jobs": {
+                "queued":     files.get("queued", 0),
+                "processing": files.get("processing", 0),
+                "completed":  files.get("completed", 0),
+                "failed":     files.get("failed", 0),
+            },
+            "active_jobs": (
+                bucket.get("queued", 0) + bucket.get("processing", 0) +
+                files.get("queued", 0) + files.get("processing", 0)
+            ),
+            "total_completed": bucket.get("completed", 0) + files.get("completed", 0),
+            "total_failed":    bucket.get("failed", 0) + files.get("failed", 0),
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
+@app.get("/jobs/active")
+async def active_jobs():
+    try:
+        async with db_pool.acquire() as conn:
+            bucket_rows = await conn.fetch("""
+                SELECT id, job_type, bucket_name, status, created_at
+                FROM bucket_jobs
+                WHERE status IN ('queued', 'processing')
+                ORDER BY created_at ASC
+            """)
+            file_rows = await conn.fetch("""
+                SELECT id, job_type, bucket_name, file_name, status, created_at
+                FROM file_jobs
+                WHERE status IN ('queued', 'processing')
+                ORDER BY created_at ASC
+            """)
+
+        return {
+            "active_count": len(bucket_rows) + len(file_rows),
+            "bucket_jobs": [
+                {
+                    "job_id": str(row['id']),
+                    "operation": row['job_type'],
+                    "bucket_name": row['bucket_name'],
+                    "status": row['status'],
+                    "queued_at": row['created_at'].isoformat(),
+                }
+                for row in bucket_rows
+            ],
+            "file_jobs": [
+                {
+                    "job_id": str(row['id']),
+                    "operation": row['job_type'],
+                    "bucket_name": row['bucket_name'],
+                    "file_name": row['file_name'],
+                    "status": row['status'],
+                    "queued_at": row['created_at'].isoformat(),
+                }
+                for row in file_rows
+            ],
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+
 @app.post("/files/upload", response_model=FileUploadResponse)
 async def upload_file(bucket_name: str = Form(...), file: UploadFile = File(...)):
     job_id = str(uuid.uuid4())
