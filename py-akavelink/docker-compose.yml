@@ -1,0 +1,85 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: akave-postgres
+    environment:
+      POSTGRES_DB: akave_platform
+      POSTGRES_USER: akave
+      POSTGRES_PASSWORD: password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U akave -d akave_platform"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Redis (Celery broker/backend)
+  redis:
+    image: redis:7-alpine
+    container_name: akave-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # FastAPI Control Plane
+  api:
+    build: .
+    container_name: akave-api
+    command: uvicorn api:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8000:8000"
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_DB=akave_platform
+      - POSTGRES_USER=akave
+      - POSTGRES_PASSWORD=password
+      - REDIS_URL=redis://redis:6379/0
+      - AKAVE_PRIVATE_KEY=${AKAVE_PRIVATE_KEY}
+      - AKAVE_NODE_ADDRESS=connect.akave.ai:5500
+    volumes:
+      - .:/app
+      - uploads_tmp:/tmp/akave_uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Celery Worker
+  worker:
+    build: .
+    container_name: akave-worker
+    command: celery -A worker worker --loglevel=info --concurrency=4
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_DB=akave_platform
+      - POSTGRES_USER=akave
+      - POSTGRES_PASSWORD=password
+      - REDIS_URL=redis://redis:6379/0
+      - AKAVE_PRIVATE_KEY=${AKAVE_PRIVATE_KEY}
+      - AKAVE_NODE_ADDRESS=connect.akave.ai:5500
+    volumes:
+      - .:/app
+      - uploads_tmp:/tmp/akave_uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  uploads_tmp:
