@@ -1,5 +1,10 @@
 # ZKML Workflows on Akave O3: ezkl Artifact Storage, Integration, and Testing
 
+**Status**: Ready to submit the plan
+**Contributor**: Patrick-Ehimen
+**Date**: February 3, 2026
+**Note**: Open for potential collaborators
+
 ## Problem Statement
 Zero-knowledge machine learning (ZKML) pipelines produce and consume large artifacts across multiple stages (model formats, compiled circuits, proving/verification keys, proofs, witness data, calibration artifacts, etc.). Today these artifacts are typically stored locally or in centralized object stores, which introduces:
 - Fragile workflows (local-only artifacts, poor portability)
