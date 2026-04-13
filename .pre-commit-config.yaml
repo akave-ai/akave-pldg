@@ -1,0 +1,27 @@
+repos:
+  - repo: https://github.com/golangci/golangci-lint
+    rev: v1.64.5
+    hooks:
+      - id: golangci-lint
+        name: golangci-lint (data-explorer)
+        args:
+          - run
+          - ./...
+        entry: golangci-lint
+        language: system
+        types: [go]
+        pass_filenames: false
+        stages: [commit]
+        additional_dependencies: []
+        # Run only in data-explorer
+        files: ^data-explorer/
+
+  - repo: local
+    hooks:
+      - id: go-test-data-explorer
+        name: go test (data-explorer)
+        entry: bash -c 'cd data-explorer && go test ./...'
+        language: system
+        pass_filenames: false
+        stages: [commit]
+

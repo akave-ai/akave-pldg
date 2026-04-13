@@ -1,0 +1,10 @@
+venv/
+.env
+.DS_Store
+bin/
+
+**/*.abi
+**/*.bin
+
+**/build/
+**/artifacts/

@@ -1,0 +1,106 @@
+name: data-explorer CI
+
+on:
+  push:
+    paths:
+      - 'data-explorer/**'
+      - '.github/workflows/data-explorer-ci.yml'
+  pull_request:
+    paths:
+      - 'data-explorer/**'
+      - '.github/workflows/data-explorer-ci.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint (golangci-lint)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: data-explorer
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: data-explorer/go.mod
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          working-directory: data-explorer
+          args: --timeout=5m
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: lint
+    defaults:
+      run:
+        working-directory: data-explorer
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: data-explorer/go.mod
+
+      - name: Go build
+        run: go build ./...
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    needs: [lint, build]
+    defaults:
+      run:
+        working-directory: data-explorer
+
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: indexer
+          POSTGRES_PASSWORD: indexer_password
+          POSTGRES_DB: blockchain_explorer
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U indexer -d blockchain_explorer"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DB_HOST: localhost
+      DB_PORT: 5432
+      DB_USER: indexer
+      DB_PASSWORD: indexer_password
+      DB_NAME: blockchain_explorer
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: data-explorer/go.mod
+
+      - name: Initialize database schema
+        run: |
+          PGPASSWORD=$DB_PASSWORD psql -h $DB_HOST -U $DB_USER -d $DB_NAME -f database/schema.sql
+        env:
+          PGPASSWORD: indexer_password
+
+      - name: Run tests
+        run: go test -v ./...
+
