@@ -1,0 +1,848 @@
+'use client';
+
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  getUploadRaw,
+  streamLogs,
+  type QueryRequest,
+  type QueryResultEntry,
+  type SSEDoneEvent,
+} from '@/lib/api';
+import LogsPageHeader from './components/LogsPageHeader';
+import RawJsonViewer from './components/RawJsonViewer';
+
+const LEVELS = ['error', 'warn', 'info', 'debug', 'fatal', 'trace'];
+
+const LEVEL_COLORS: Record<string, string> = {
+  error: 'text-red-400 bg-red-400/10 border-red-400/30',
+  fatal: 'text-red-300 bg-red-300/10 border-red-300/30',
+  warn:  'text-yellow-400 bg-yellow-400/10 border-yellow-400/30',
+  info:  'text-cyan-400 bg-cyan-400/10 border-cyan-400/30',
+  debug: 'text-zinc-400 bg-zinc-400/10 border-zinc-400/30',
+  trace: 'text-purple-400 bg-purple-400/10 border-purple-400/30',
+};
+
+const LEVEL_DOT: Record<string, string> = {
+  error: 'bg-red-400',
+  fatal: 'bg-red-300',
+  warn:  'bg-yellow-400',
+  info:  'bg-cyan-400',
+  debug: 'bg-zinc-400',
+  trace: 'bg-purple-400',
+};
+
+const GRAPH_LEVEL_BADGE: Record<string, string> = {
+  error: 'bg-red-500/20 text-red-300 border-red-400/50',
+  fatal: 'bg-rose-500/20 text-rose-300 border-rose-400/50',
+  warn: 'bg-yellow-500/20 text-yellow-300 border-yellow-400/50',
+  info: 'bg-cyan-500/20 text-cyan-300 border-cyan-400/50',
+  debug: 'bg-zinc-500/20 text-zinc-300 border-zinc-400/50',
+  trace: 'bg-purple-500/20 text-purple-300 border-purple-400/50',
+};
+
+const GRAPH_LEVEL_STROKE: Record<string, string> = {
+  error: '#ef4444',
+  fatal: '#fb7185',
+  warn: '#facc15',
+  info: '#22d3ee',
+  debug: '#a1a1aa',
+  trace: '#a855f7',
+};
+
+/** Rows per page (initial load AND each scroll page). */
+const PAGE_SIZE = 50;
+
+function levelStyle(level: string) {
+  return LEVEL_COLORS[level.toLowerCase()] ?? 'text-zinc-400 bg-zinc-400/10 border-zinc-400/30';
+}
+function levelDot(level: string) {
+  return LEVEL_DOT[level.toLowerCase()] ?? 'bg-zinc-400';
+}
+
+function fmtTimestamp(ts: string): string {
+  try {
+    const d = new Date(ts);
+    const date = d.toLocaleDateString('en-GB', { month: 'short', day: '2-digit' });
+    const time = d.toLocaleTimeString('en-GB', { hour12: false });
+    const ms = String(d.getMilliseconds()).padStart(3, '0');
+    return `${date} ${time}.${ms}`;
+  } catch { return ts; }
+}
+
+function fmtRelative(ts: string): string {
+  try {
+    const diff = Date.now() - new Date(ts).getTime();
+    const s = Math.max(0, Math.floor(diff / 1000));
+    if (s < 60) return `${s}s ago`;
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m}m ago`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `${h}h ago`;
+    const d = Math.floor(h / 24);
+    return `${d}d ago`;
+  } catch {
+    return ts;
+  }
+}
+
+function toRFC3339(localValue: string): string {
+  if (!localValue) return '';
+  return new Date(localValue).toISOString();
+}
+
+function fromRFC3339ToLocal(iso: string): string {
+  if (!iso) return '';
+  const d = new Date(iso);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+type SearchState = 'idle' | 'streaming' | 'done' | 'error';
+
+interface Filters {
+  service: string;
+  keyword: string;
+  selectedLevels: string[];
+  fromTime: string;  // user-set lower bound (optional)
+  toTime: string;    // user-set upper bound (optional)
+  limit: number;
+}
+
+const DEFAULT_FILTERS: Filters = {
+  service: '',
+  keyword: '',
+  selectedLevels: [],
+  fromTime: '',
+  toTime: '',
+  limit: PAGE_SIZE,
+};
+
+export default function LogsPage() {
+  // ── Filter form ─────────────────────────────────────────────────────────────
+  const [filters, setFilters] = useState<Filters>(DEFAULT_FILTERS);
+
+  // ── Results ─────────────────────────────────────────────────────────────────
+  const [results, setResults]       = useState<QueryResultEntry[]>([]);
+  const [searchState, setSearchState] = useState<SearchState>('idle');
+  const [summary, setSummary]        = useState<SSEDoneEvent | null>(null);
+  const [streamError, setStreamError] = useState<string | null>(null);
+  const [expandedIdx, setExpandedIdx] = useState<number | null>(null);
+  const [rawExpandedIdx, setRawExpandedIdx] = useState<number | null>(null);
+  const [rawByKey, setRawByKey] = useState<Record<string, string>>({});
+  const [rawLoadingKey, setRawLoadingKey] = useState<string | null>(null);
+  const [wrapRaw, setWrapRaw] = useState(true);
+  const [relativeTime, setRelativeTime] = useState(false);
+  const [density, setDensity] = useState<'compact' | 'comfortable'>('comfortable');
+  /** Whether there are more pages to load (backend said truncated on last page). */
+  const [hasMore, setHasMore] = useState(false);
+
+  // ── Refs ─────────────────────────────────────────────────────────────────────
+  const abortRef   = useRef<AbortController | null>(null);
+  const listRef    = useRef<HTMLDivElement>(null);
+  const isFetching = useRef(false); // prevent concurrent fetches
+
+  // ── Helpers ──────────────────────────────────────────────────────────────────
+  const patchFilters = (patch: Partial<Filters>) =>
+    setFilters(prev => ({ ...prev, ...patch }));
+
+  const toggleLevel = (l: string) =>
+    setFilters(prev => ({
+      ...prev,
+      selectedLevels: prev.selectedLevels.includes(l)
+        ? prev.selectedLevels.filter(x => x !== l)
+        : [...prev.selectedLevels, l],
+    }));
+
+  /**
+   * Execute a query.
+   *
+   * @param filtersSnapshot  The filter values to use (snapshot avoids stale closures).
+   * @param append           If true, append results to existing list (scroll page).
+   *                         If false, clear and start fresh (new search).
+   * @param timeEndOverride  When paginating: the oldest row's timestamp becomes the
+   *                         upper bound so we fetch the next batch of older logs.
+   */
+  const runQuery = useCallback((
+    filtersSnapshot: Filters,
+    append: boolean,
+    timeEndOverride?: string,
+  ) => {
+    abortRef.current?.abort();
+    isFetching.current = true;
+
+    if (!append) {
+      setResults([]);
+      setSummary(null);
+      setStreamError(null);
+      setExpandedIdx(null);
+      setHasMore(false);
+    }
+
+    setSearchState('streaming');
+
+    const req: QueryRequest = {
+      service:    filtersSnapshot.service.trim() || undefined,
+      keyword:    filtersSnapshot.keyword.trim() || undefined,
+      levels:     filtersSnapshot.selectedLevels.length ? filtersSnapshot.selectedLevels : undefined,
+      time_start: filtersSnapshot.fromTime ? toRFC3339(filtersSnapshot.fromTime) : undefined,
+      // When paginating backward, override the upper time bound with the oldest already-shown ts
+      time_end:   timeEndOverride ?? (filtersSnapshot.toTime ? toRFC3339(filtersSnapshot.toTime) : undefined),
+      limit:      filtersSnapshot.limit,
+    };
+
+    const collected: QueryResultEntry[] = [];
+
+    const ctrl = streamLogs(
+      req,
+      (entry) => {
+        collected.push(entry);
+        // Append in arrival order — backend now sends newest first, so this is correct
+        setResults(prev => append ? [...prev, ...[] /* batch added below */] : collected.slice());
+      },
+      (done) => {
+        setSummary(done);
+        // hasMore: backend says truncated AND we collected a full page
+        setHasMore(done.truncated && collected.length >= filtersSnapshot.limit);
+        // Flush collected into state as one final update for append mode
+        if (append) {
+          setResults(prev => [...prev, ...collected]);
+        } else {
+          setResults(collected.slice());
+        }
+        setSearchState('done');
+        isFetching.current = false;
+      },
+      (err) => {
+        setStreamError(err);
+        setSearchState('error');
+        isFetching.current = false;
+      },
+    );
+
+    abortRef.current = ctrl;
+  }, []);
+
+  // ── Scroll → load more ───────────────────────────────────────────────────────
+  const handleScroll = useCallback(() => {
+    const el = listRef.current;
+    if (!el) return;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 150;
+
+    if (nearBottom && !isFetching.current && hasMore) {
+      // Capture state values we need right now via a functional update
+      setResults(prev => {
+        if (prev.length === 0) return prev;
+        // The last element is the oldest row (backend sends newest-first,
+        // but we may reverse in UI — use the actual last item in the array
+        // which is the oldest in the original stream order).
+        const oldest = prev[prev.length - 1];
+        // Subtract 1ns to exclude that exact timestamp and avoid duplicates
+        const cursor = new Date(new Date(oldest.timestamp).getTime() - 1).toISOString();
+        setFilters(currentFilters => {
+          runQuery(currentFilters, true, cursor);
+          return currentFilters; // no change to filters
+        });
+        return prev; // no immediate state change
+      });
+    }
+  }, [hasMore, runQuery]);
+
+  // ── Initial auto-load on mount ─────────────────────────────────────────────
+  const didMount = useRef(false);
+  useEffect(() => {
+    if (didMount.current) return;
+    didMount.current = true;
+    runQuery(DEFAULT_FILTERS, false);
+  }, [runQuery]);
+
+  // ── Action handlers ─────────────────────────────────────────────────────────
+  const handleSearch = () => runQuery(filters, false);
+
+  const handleClear = () => {
+    abortRef.current?.abort();
+    isFetching.current = false;
+    setResults([]);
+    setSummary(null);
+    setStreamError(null);
+    setSearchState('idle');
+    setExpandedIdx(null);
+    setRawExpandedIdx(null);
+    setRawByKey({});
+    setRawLoadingKey(null);
+    setWrapRaw(true);
+    setRelativeTime(false);
+    setDensity('comfortable');
+    setHasMore(false);
+    setFilters(DEFAULT_FILTERS);
+  };
+
+  const handleCancel = () => {
+    abortRef.current?.abort();
+    isFetching.current = false;
+    setSearchState('done');
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter') handleSearch();
+  };
+
+  const formatRawJsonForEntry = (content: string, entry: QueryResultEntry): string => {
+    try {
+      const parsed = JSON.parse(content) as {
+        labels?: Record<string, string>;
+        entries?: Array<{ ts_ns?: number; line?: string }>;
+      };
+      if (Array.isArray(parsed?.entries)) {
+        const matched =
+          parsed.entries.find((e) => Number(e.ts_ns) === Number(entry.ts_ns)) ||
+          parsed.entries.find((e) => (e.line || '') === entry.line);
+        if (matched) {
+          return JSON.stringify(
+            {
+              labels: parsed.labels || {},
+              entry: matched,
+            },
+            null,
+            2
+          );
+        }
+      }
+      return JSON.stringify(parsed, null, 2);
+    } catch {
+      return content;
+    }
+  };
+
+  const toggleRawLog = async (idx: number, objectKey: string) => {
+    if (rawExpandedIdx === idx) {
+      setRawExpandedIdx(null);
+      return;
+    }
+    setRawExpandedIdx(idx);
+    if (rawByKey[objectKey]) return;
+    setRawLoadingKey(objectKey);
+    try {
+      const res = await getUploadRaw(objectKey);
+      setRawByKey(prev => ({ ...prev, [objectKey]: res.content }));
+    } catch (e) {
+      setRawByKey(prev => ({
+        ...prev,
+        [objectKey]: e instanceof Error ? e.message : 'Failed to load raw log',
+      }));
+    } finally {
+      setRawLoadingKey(null);
+    }
+  };
+
+  const copyText = async (text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      // ignore
+    }
+  };
+
+  // Graph uses currently rendered results (after filters/search).
+  const graphLogs = useMemo(() => results, [results]);
+
+  const timelineGraph = useMemo(() => {
+    if (graphLogs.length === 0) return { bars: [] as number[], max: 0, levelBars: {} as Record<string, number[]> };
+    const bucketCount = 40;
+    const buckets = new Array(bucketCount).fill(0);
+    const levelBars: Record<string, number[]> = {};
+    for (const l of LEVELS) levelBars[l] = new Array(bucketCount).fill(0);
+    const times = graphLogs.map((r) => new Date(r.timestamp).getTime()).filter((t) => Number.isFinite(t));
+    if (times.length === 0) return { bars: buckets, max: 0, levelBars };
+    const min = Math.min(...times);
+    const max = Math.max(...times);
+    const span = Math.max(1, max - min);
+    for (const r of graphLogs) {
+      const t = new Date(r.timestamp).getTime();
+      if (!Number.isFinite(t)) continue;
+      const idx = Math.min(bucketCount - 1, Math.floor(((t - min) / span) * bucketCount));
+      buckets[idx] += 1;
+      const lvl = (r.level || 'info').toLowerCase();
+      if (levelBars[lvl]) levelBars[lvl][idx] += 1;
+    }
+    return { bars: buckets, max: Math.max(...buckets), levelBars };
+  }, [graphLogs]);
+
+  const levelCounts = useMemo(() => {
+    const out: Record<string, number> = { error: 0, warn: 0, info: 0, debug: 0, fatal: 0, trace: 0 };
+    for (const r of graphLogs) {
+      const l = (r.level || 'info').toLowerCase();
+      if (out[l] !== undefined) out[l] += 1;
+    }
+    return out;
+  }, [graphLogs]);
+
+  const timelineBounds = useMemo(() => {
+    const times = graphLogs
+      .map((r) => new Date(r.timestamp).getTime())
+      .filter((t) => Number.isFinite(t))
+      .sort((a, b) => a - b);
+    if (times.length === 0) return null;
+    const start = times[0];
+    const end = times[times.length - 1];
+    const mid = Math.floor((start + end) / 2);
+    return { start, mid, end };
+  }, [graphLogs]);
+
+  // ── Render ──────────────────────────────────────────────────────────────────
+  return (
+    <div className="h-screen flex flex-col bg-[var(--bg)] overflow-hidden">
+
+      <LogsPageHeader />
+
+      {/* Filter bar */}
+      <div className="shrink-0 border-b border-[var(--border)] bg-[var(--card)] px-4 py-3 space-y-3 shadow-sm">
+
+        {/* Row 1: time range */}
+        <div className="flex flex-wrap gap-3 items-center">
+          <div className="flex items-center gap-2">
+            <label className="text-xs text-[var(--muted)] font-medium uppercase tracking-wider w-10">From</label>
+            <input
+              type="datetime-local"
+              value={filters.fromTime}
+              onChange={e => patchFilters({ fromTime: e.target.value })}
+              className="rounded bg-[var(--bg)] border border-[var(--border)] px-2 py-1 text-xs font-mono text-[var(--text)] focus:outline-none focus:border-[var(--accent)] transition-colors"
+            />
+          </div>
+          <div className="flex items-center gap-2">
+            <label className="text-xs text-[var(--muted)] font-medium uppercase tracking-wider w-4">To</label>
+            <input
+              type="datetime-local"
+              value={filters.toTime}
+              onChange={e => patchFilters({ toTime: e.target.value })}
+              className="rounded bg-[var(--bg)] border border-[var(--border)] px-2 py-1 text-xs font-mono text-[var(--text)] focus:outline-none focus:border-[var(--accent)] transition-colors"
+            />
+          </div>
+          <div className="flex gap-1">
+            {[
+              { label: '15m', ms: 15 * 60 * 1000 },
+              { label: '1h',  ms: 60 * 60 * 1000 },
+              { label: '6h',  ms: 6 * 60 * 60 * 1000 },
+              { label: '24h', ms: 24 * 60 * 60 * 1000 },
+            ].map(({ label, ms }) => (
+              <button
+                key={label}
+                type="button"
+                onClick={() => {
+                  const now = new Date();
+                  patchFilters({
+                    toTime:   fromRFC3339ToLocal(now.toISOString()),
+                    fromTime: fromRFC3339ToLocal(new Date(Date.now() - ms).toISOString()),
+                  });
+                }}
+                className="px-2 py-1 rounded text-xs text-[var(--muted)] border border-[var(--border)] hover:border-[var(--accent)] hover:text-[var(--accent)] transition-colors"
+              >
+                {label}
+              </button>
+            ))}
+            {(filters.fromTime || filters.toTime) && (
+              <button
+                type="button"
+                onClick={() => patchFilters({ fromTime: '', toTime: '' })}
+                className="px-2 py-1 rounded text-xs text-[var(--muted)] border border-[var(--border)] hover:border-red-400 hover:text-red-400 transition-colors"
+              >
+                ✕ time
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Row 2: service / keyword / levels / limit / actions */}
+        <div className="flex flex-wrap gap-3 items-center">
+          <input
+            type="text"
+            value={filters.service}
+            onChange={e => patchFilters({ service: e.target.value })}
+            onKeyDown={handleKeyDown}
+            placeholder="service name…"
+            className="rounded bg-[var(--bg)] border border-[var(--border)] px-3 py-1.5 text-xs font-mono text-[var(--text)] placeholder:text-[var(--muted)] focus:outline-none focus:border-[var(--accent)] transition-colors w-44"
+          />
+          <input
+            type="text"
+            value={filters.keyword}
+            onChange={e => patchFilters({ keyword: e.target.value })}
+            onKeyDown={handleKeyDown}
+            placeholder="keyword search…"
+            className="rounded bg-[var(--bg)] border border-[var(--border)] px-3 py-1.5 text-xs font-mono text-[var(--text)] placeholder:text-[var(--muted)] focus:outline-none focus:border-[var(--accent)] transition-colors w-48"
+          />
+
+          {/* Level toggles */}
+          <div className="flex gap-1 flex-wrap">
+            {LEVELS.map(l => {
+              const active = filters.selectedLevels.includes(l);
+              return (
+                <button
+                  key={l}
+                  type="button"
+                  onClick={() => toggleLevel(l)}
+                  className={`px-2 py-1 rounded text-xs font-medium border transition-all ${
+                    active ? levelStyle(l) : 'text-[var(--muted)] border-[var(--border)] hover:border-[var(--muted)]'
+                  }`}
+                >
+                  {l}
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Limit */}
+          <div className="flex items-center gap-1.5">
+            <label className="text-xs text-[var(--muted)]">limit</label>
+            <input
+              type="number"
+              value={filters.limit}
+              onChange={e => patchFilters({ limit: Math.max(1, Math.min(1000, parseInt(e.target.value) || PAGE_SIZE)) })}
+              min={1}
+              max={1000}
+              className="rounded bg-[var(--bg)] border border-[var(--border)] px-2 py-1 text-xs font-mono text-[var(--text)] focus:outline-none focus:border-[var(--accent)] transition-colors w-20"
+            />
+          </div>
+
+          {/* Buttons */}
+          <div className="flex gap-2 ml-auto">
+            <button
+              type="button"
+              onClick={() => setRelativeTime(v => !v)}
+              className="px-2 py-1.5 rounded text-xs border border-[var(--border)] text-[var(--muted)] hover:text-[var(--accent)] transition-colors"
+            >
+              {relativeTime ? 'Absolute time' : 'Relative time'}
+            </button>
+            <button
+              type="button"
+              onClick={() => setDensity(v => (v === 'compact' ? 'comfortable' : 'compact'))}
+              className="px-2 py-1.5 rounded text-xs border border-[var(--border)] text-[var(--muted)] hover:text-[var(--accent)] transition-colors"
+            >
+              {density === 'compact' ? 'Comfortable rows' : 'Compact rows'}
+            </button>
+            <button
+              type="button"
+              onClick={handleClear}
+              className="px-3 py-1.5 rounded text-xs border border-[var(--border)] text-[var(--muted)] hover:text-red-400 hover:border-red-400/50 transition-colors"
+            >
+              Clear
+            </button>
+            {searchState === 'streaming' ? (
+              <button
+                type="button"
+                onClick={handleCancel}
+                className="px-4 py-1.5 rounded text-xs bg-red-500/20 border border-red-500/40 text-red-400 hover:bg-red-500/30 transition-colors"
+              >
+                ■ Stop
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={handleSearch}
+                className="px-4 py-1.5 rounded text-xs bg-[var(--accent)] text-[var(--bg)] font-semibold hover:opacity-90 transition-opacity"
+              >
+                Search
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+
+
+
+      {/* Top graph (latest 200) */}
+      <section className="shrink-0 border-b border-[var(--border)] bg-[var(--card)]/60 px-4 py-3">
+        <div className="flex items-center justify-between mb-2">
+          <h3 className="text-xs uppercase tracking-wider text-[var(--muted)] font-semibold">
+            Live Graph (current results)
+          </h3>
+          <span className="text-[10px] text-[var(--muted)]">
+            updates from rendered filtered logs
+          </span>
+        </div>
+        <div className="rounded border border-[var(--border)] bg-[var(--bg)] p-3">
+          <div className="h-64 border border-[var(--border)]/60 rounded-md bg-[var(--card)]/30 p-2">
+            {graphLogs.length === 0 ? (
+              <div className="h-full flex items-center justify-center text-[10px] text-[var(--muted)]">
+                No log data yet
+              </div>
+            ) : (
+              <svg className="w-full h-full" viewBox="0 0 1000 240" preserveAspectRatio="none">
+                <line x1="0" y1="239" x2="1000" y2="239" stroke="rgba(255,255,255,0.25)" strokeWidth="1" />
+                {LEVELS.map((lvl) => {
+                  const arr = timelineGraph.levelBars[lvl] || [];
+                  if (arr.length === 0 || timelineGraph.max <= 0) return null;
+                  const points = arr
+                    .map((v, i) => {
+                      const x = (i / Math.max(1, arr.length - 1)) * 1000;
+                      const y = 239 - (v / timelineGraph.max) * 220;
+                      return `${x},${Math.max(6, y)}`;
+                    })
+                    .join(' ');
+                  return (
+                    <polyline
+                      key={lvl}
+                      fill="none"
+                      stroke={GRAPH_LEVEL_STROKE[lvl] || '#22d3ee'}
+                      strokeWidth="2"
+                      points={points}
+                      opacity="0.95"
+                    />
+                  );
+                })}
+              </svg>
+            )}
+          </div>
+          <div className="mt-2 flex items-center justify-between text-[10px] text-[var(--muted)]">
+            <span>{timelineBounds ? fmtTimestamp(new Date(timelineBounds.start).toISOString()) : '—'}</span>
+            <span>{timelineBounds ? fmtTimestamp(new Date(timelineBounds.mid).toISOString()) : '—'}</span>
+            <span>{timelineBounds ? fmtTimestamp(new Date(timelineBounds.end).toISOString()) : '—'}</span>
+          </div>
+          <div className="mt-1 h-1 rounded bg-[var(--border)]/40 relative overflow-hidden">
+            <div className="absolute left-0 top-0 h-full w-px bg-[var(--muted)]/80" />
+            <div className="absolute left-1/2 top-0 h-full w-px bg-[var(--muted)]/60" />
+            <div className="absolute right-0 top-0 h-full w-px bg-[var(--muted)]/80" />
+          </div>
+
+          <div className="mt-3 flex flex-wrap gap-2 text-[10px]">
+            {LEVELS.map((l) => (
+              <span
+                key={l}
+                className={`px-2 py-0.5 rounded border font-semibold ${GRAPH_LEVEL_BADGE[l] ?? 'bg-[var(--card)] text-[var(--text)] border-[var(--border)]'}`}
+              >
+                {l}: {levelCounts[l] ?? 0}
+              </span>
+            ))}
+          </div>
+        </div>
+      </section>
+      {/* Bottom logs list in separate container */}
+      <div className="flex-1 min-h-0 flex flex-col">
+        <div className="shrink-0 px-4 py-2 border-b border-[var(--border)] bg-[var(--card)]/50">
+          <h3 className="text-xs uppercase tracking-wider text-[var(--muted)] font-semibold">
+            Logs List (newest at top)
+          </h3>
+        </div>
+        <div className="shrink-0 border-b border-[var(--border)] bg-[var(--card)]/35 px-4 py-2 flex items-center gap-4 text-xs text-[var(--muted)]">
+          {searchState === 'streaming' && !hasMore && (
+            <span className="flex items-center gap-1.5">
+              <span className="inline-block w-1.5 h-1.5 rounded-full bg-[var(--accent)] animate-pulse" />
+              loading…
+            </span>
+          )}
+          {searchState === 'streaming' && hasMore && (
+            <span className="flex items-center gap-1.5">
+              <span className="inline-block w-1.5 h-1.5 rounded-full bg-[var(--accent)] animate-pulse" />
+              loading more…
+            </span>
+          )}
+          {searchState === 'done' && summary && (
+            <span className="text-[var(--success)]">
+              ✓ {results.length} result{results.length !== 1 ? 's' : ''}
+              {hasMore && <span className="text-[var(--warn)] ml-2">· scroll for more ↓</span>}
+            </span>
+          )}
+          {searchState === 'error' && <span className="text-red-400">✗ {streamError}</span>}
+          {searchState === 'idle' && results.length === 0 && (
+            <span>Set filters and click Search, or results will load automatically.</span>
+          )}
+          {results.length > 0 && (
+            <span className="ml-auto text-[var(--muted)]/90">{results.length} entries loaded</span>
+          )}
+        </div>
+        <div
+          ref={listRef}
+          onScroll={handleScroll}
+          className="flex-1 overflow-y-auto font-mono text-xs"
+        >
+        {results.length === 0 && searchState !== 'streaming' ? (
+          <div className="flex flex-col items-center justify-center h-full text-[var(--muted)] gap-2">
+            <span className="text-2xl opacity-30">⌕</span>
+            <span>No results</span>
+          </div>
+        ) : (
+          <table className="w-full border-collapse">
+            <thead className="sticky top-0 bg-[var(--bg)] z-10">
+              <tr className="text-[var(--muted)] uppercase text-[10px] tracking-wider border-b border-[var(--border)]">
+                <th className="px-3 py-1.5 text-left font-medium w-44">Timestamp</th>
+                <th className="px-3 py-1.5 text-left font-medium w-28">Service</th>
+                <th className="px-3 py-1.5 text-left font-medium w-16">Level</th>
+                <th className="px-3 py-1.5 text-left font-medium">Message</th>
+              </tr>
+            </thead>
+            <tbody>
+              {results.map((entry, idx) => {
+                const isExpanded = expandedIdx === idx;
+                const showRaw = rawExpandedIdx === idx;
+                return (
+                  <>
+                    <tr
+                      key={`${entry.ts_ns}-${idx}`}
+                      onClick={() => setExpandedIdx(isExpanded ? null : idx)}
+                      className={`border-b border-[var(--border)]/40 cursor-pointer transition-colors ${
+                        isExpanded ? 'bg-[var(--card)]' : 'hover:bg-[var(--card)]/70'
+                      }`}
+                    >
+                      <td className={`px-3 ${density === 'compact' ? 'py-1' : 'py-1.5'} text-[var(--muted)] whitespace-nowrap`}>
+                        {relativeTime ? fmtRelative(entry.timestamp) : fmtTimestamp(entry.timestamp)}
+                      </td>
+                      <td className={`px-3 ${density === 'compact' ? 'py-1' : 'py-1.5'} text-[var(--warn)] truncate max-w-[7rem]`} title={entry.service}>{entry.service}</td>
+                      <td className={`px-3 ${density === 'compact' ? 'py-1' : 'py-1.5'}`}>
+                        <span className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] border font-medium ${levelStyle(entry.level)}`}>
+                          <span className={`w-1 h-1 rounded-full ${levelDot(entry.level)}`} />
+                          {entry.level.toUpperCase()}
+                        </span>
+                      </td>
+                      <td className={`px-3 ${density === 'compact' ? 'py-1' : 'py-1.5'} text-[var(--text)] truncate max-w-0`} style={{ maxWidth: 1 }}>
+                        <span className="block truncate" title={entry.line}>{entry.line}</span>
+                      </td>
+                    </tr>
+
+                    {isExpanded && (
+                      <tr key={`detail-${idx}`} className="bg-[var(--card)] border-b border-[var(--border)]">
+                        <td colSpan={4} className="px-4 py-3">
+                          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <div className="md:col-span-2">
+                              <p className="text-[10px] uppercase tracking-wider text-[var(--muted)] mb-1">Message</p>
+                              <pre className="text-xs text-[var(--text)] bg-[var(--bg)] rounded border border-[var(--border)] p-3 whitespace-pre-wrap break-words leading-relaxed">{entry.line}</pre>
+                            </div>
+                            {showRaw && (
+                              <div className="md:col-span-2">
+                                <p className="text-[10px] uppercase tracking-wider text-[var(--muted)] mb-1">Raw Log JSON</p>
+                                {rawLoadingKey === entry.o3_object_key ? (
+                                  <pre className="text-xs font-mono overflow-auto max-h-[420px] p-3 rounded border border-[var(--border)] bg-[var(--bg)] text-[var(--text)] whitespace-pre-wrap break-words">
+                                    Loading raw log...
+                                  </pre>
+                                ) : (
+                                  <RawJsonViewer
+                                    content={formatRawJsonForEntry(rawByKey[entry.o3_object_key] ?? 'Raw log not loaded', entry)}
+                                    wrap={wrapRaw}
+                                  />
+                                )}
+                              </div>
+                            )}
+                            <div className="space-y-2 text-xs">
+                              <p className="text-[10px] uppercase tracking-wider text-[var(--muted)]">Metadata</p>
+                              <div className="bg-[var(--bg)] rounded border border-[var(--border)] divide-y divide-[var(--border)]">
+                                {[
+                                  ['Timestamp', fmtTimestamp(entry.timestamp)],
+                                  ['ts_ns',     String(entry.ts_ns)],
+                                  ['Service',   entry.service],
+                                  ['Level',     entry.level],
+                                ].map(([k, v]) => (
+                                  <div key={k} className="flex px-3 py-1.5 gap-3">
+                                    <span className="text-[var(--muted)] w-20 shrink-0">{k}</span>
+                                    <span className="text-[var(--text)] font-mono break-all">{v}</span>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                            <div className="space-y-2 text-xs">
+                              <p className="text-[10px] uppercase tracking-wider text-[var(--muted)]">Labels</p>
+                              <div className="bg-[var(--bg)] rounded border border-[var(--border)] divide-y divide-[var(--border)]">
+                                {Object.entries(entry.labels).map(([k, v]) => (
+                                  <div key={k} className="flex px-3 py-1.5 gap-3">
+                                    <span className="text-[var(--muted)] w-20 shrink-0 truncate" title={k}>{k}</span>
+                                    <span className="text-[var(--accent)] font-mono break-all">{v}</span>
+                                  </div>
+                                ))}
+                                {Object.keys(entry.labels).length === 0 && (
+                                  <div className="px-3 py-1.5 text-[var(--muted)]">—</div>
+                                )}
+                              </div>
+                              <p className="text-[10px] uppercase tracking-wider text-[var(--muted)] mt-2">O3 Object</p>
+                              <p className="font-mono text-[var(--accent)] break-all bg-[var(--bg)] rounded border border-[var(--border)] px-3 py-1.5 text-[10px]">{entry.o3_object_key}</p>
+                            </div>
+                          </div>
+                          <div className="mt-3 flex items-center gap-4">
+                            <button
+                              type="button"
+                              onClick={async e => {
+                                e.stopPropagation();
+                                await toggleRawLog(idx, entry.o3_object_key);
+                              }}
+                              className="text-[10px] px-2 py-1 rounded border border-[var(--border)] text-[var(--muted)] hover:text-[var(--accent)] hover:border-[var(--accent)] transition-colors"
+                            >
+                              {showRaw ? 'hide raw log' : 'show raw log'}
+                            </button>
+                            {showRaw && (
+                              <>
+                                <button
+                                  type="button"
+                                  onClick={e => {
+                                    e.stopPropagation();
+                                    setWrapRaw(v => !v);
+                                  }}
+                                  className="text-[10px] px-2 py-1 rounded border border-[var(--border)] text-[var(--muted)] hover:text-[var(--accent)] transition-colors"
+                                >
+                                  {wrapRaw ? 'nowrap' : 'wrap'}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={e => {
+                                    e.stopPropagation();
+                                    void copyText(rawByKey[entry.o3_object_key] ?? '');
+                                  }}
+                                  className="text-[10px] px-2 py-1 rounded border border-[var(--border)] text-[var(--muted)] hover:text-[var(--accent)] transition-colors"
+                                >
+                                  copy raw
+                                </button>
+                              </>
+                            )}
+                            <button
+                              type="button"
+                              onClick={e => {
+                                e.stopPropagation();
+                                void copyText(entry.line);
+                              }}
+                              className="text-[10px] px-2 py-1 rounded border border-[var(--border)] text-[var(--muted)] hover:text-[var(--accent)] transition-colors"
+                            >
+                              copy msg
+                            </button>
+                            <button
+                              type="button"
+                              onClick={e => {
+                                e.stopPropagation();
+                                setExpandedIdx(null);
+                                setRawExpandedIdx(null);
+                              }}
+                              className="text-[10px] px-2 py-1 rounded border border-[var(--border)] text-[var(--muted)] hover:text-[var(--text)] transition-colors"
+                            >
+                              ▲ collapse
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                  </>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+
+        {/* Streaming skeleton */}
+        {searchState === 'streaming' && (
+          <div className="px-3 py-2 space-y-1.5 animate-pulse">
+            {[...Array(4)].map((_, i) => (
+              <div key={i} className="h-6 rounded bg-[var(--card)] opacity-50" style={{ width: `${55 + (i * 13) % 35}%` }} />
+            ))}
+          </div>
+        )}
+
+        {/* Load more footer */}
+        {searchState === 'done' && hasMore && (
+          <div className="px-4 py-4 text-center text-xs text-[var(--muted)] border-t border-[var(--border)]/40">
+            <span className="opacity-50">↓ scroll to load older logs</span>
+          </div>
+        )}
+
+        {/* End of results */}
+        {searchState === 'done' && !hasMore && results.length > 0 && (
+          <div className="px-4 py-3 text-center text-[10px] text-[var(--muted)]/40 border-t border-[var(--border)]/20">
+            — end of results —
+          </div>
+        )}
+        </div>
+      </div>
+    </div>
+  );
+}

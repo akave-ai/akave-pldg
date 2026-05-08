@@ -1,0 +1,26 @@
+version: '3'
+
+
+
+tasks:
+  help:
+    desc: print this help message
+    cmds:
+    - task --list-all
+    silent: true
+
+
+  run:
+    desc: run the cmd/akavelog application
+    cmds:
+    - go run ./cmd/akavelog
+
+  tidy:
+    desc: format all .go files, and tidy and vendor module dependencies
+    cmds:
+    - echo 'Formatting .go files...'
+    - go fmt ./...
+    - echo 'Tidying module dependencies...'
+    - go mod tidy
+    - echo 'Verifying dependencies...'
+    - go mod verify
